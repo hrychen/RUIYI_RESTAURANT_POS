@@ -23416,14 +23416,19 @@ class ProfessionalPOS {
                     </button>
                 ` : '';
 
-                actionButtons = `
-                    ${invoiceBtn}
-                    ${invoiceOrDownloadBtn}
-                    ${returnBtn}
+                // 🔥 批发商发票模式下隐藏作废按钮（已开票订单应通过退货发票处理，不能直接作废）
+                const voidBtn = pos.wholesaleInvoiceEnabled ? '' : `
                     <button onclick="pos.voidOrder(${order.id}, false)"
                             class="px-4 py-2 rounded-lg text-sm font-medium transition-colors bg-red-500 hover:bg-red-600 text-white">
                         ${voidBtnText}
                     </button>
+                `;
+
+                actionButtons = `
+                    ${invoiceBtn}
+                    ${invoiceOrDownloadBtn}
+                    ${returnBtn}
+                    ${voidBtn}
                 `;
             } else {
                 // 待付款订单 - 显示预结单、完成和删除按钮
@@ -24431,46 +24436,60 @@ class ProfessionalPOS {
      */
     async searchRectificativaCustomer(query) {
         const resultsDiv = document.getElementById('rectificativa-customer-results');
-        if (!query || query.length < 2) {
+        if (!query || query.trim().length < 1) {
+            resultsDiv.classList.add('hidden');
+            return;
+        }
+        // 非数字需要至少2个字符
+        const trimmed = query.trim();
+        if (trimmed.length < 2 && !/^\d+$/.test(trimmed)) {
             resultsDiv.classList.add('hidden');
             return;
         }
 
-        try {
-            const response = await fetch(ruiyi_pos_ajax.ajax_url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                },
-                body: new URLSearchParams({
-                    action: 'ruiyi_pos_ajax',
-                    pos_action: 'search_customers',
-                    nonce: ruiyi_pos_ajax.nonce,
-                    query: query
-                })
-            });
-
-            const data = await response.json();
-            if (data.success && data.data && data.data.length > 0) {
-                let html = '';
-                data.data.forEach(customer => {
-                    html += `
-                        <div class="p-3 hover:bg-gray-100 cursor-pointer border-b last:border-b-0"
-                             onclick="pos.selectRectificativaCustomer(${JSON.stringify(customer).replace(/"/g, '&quot;')})">
-                            <div class="font-medium">${customer.customer_name || customer.company || 'Sin nombre'}</div>
-                            <div class="text-sm text-gray-500">${customer.cif || ''} - ${customer.city || ''}</div>
-                        </div>
-                    `;
+        clearTimeout(this._rectSearchTimer);
+        this._rectSearchTimer = setTimeout(async () => {
+            try {
+                const response = await fetch(ruiyi_pos_ajax.ajax_url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: new URLSearchParams({
+                        action: 'ruiyi_pos_ajax',
+                        pos_action: 'search_customers',
+                        nonce: ruiyi_pos_ajax.nonce,
+                        query: trimmed
+                    })
                 });
-                resultsDiv.innerHTML = html;
-                resultsDiv.classList.remove('hidden');
-            } else {
+
+                const data = await response.json();
+                if (data.success && data.data && data.data.length > 0) {
+                    let html = '';
+                    data.data.forEach(customer => {
+                        const num = customer.customer_number ? `#${customer.customer_number}` : '';
+                        html += `
+                            <div class="p-3 hover:bg-blue-50 cursor-pointer border-b last:border-b-0"
+                                 onclick="pos.selectRectificativaCustomer(${JSON.stringify(customer).replace(/"/g, '&quot;')})">
+                                <div class="flex items-center justify-between">
+                                    <span class="font-medium">${customer.customer_name || customer.company || 'Sin nombre'}</span>
+                                    ${num ? `<span class="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">${num}</span>` : ''}
+                                </div>
+                                <div class="text-sm text-gray-500">${[customer.cif || '', customer.phone || '', customer.city || ''].filter(Boolean).join(' | ')}</div>
+                            </div>
+                        `;
+                    });
+                    resultsDiv.innerHTML = html;
+                    resultsDiv.classList.remove('hidden');
+                } else {
+                    resultsDiv.innerHTML = '<div class="p-3 text-sm text-gray-400 text-center">未找到客户</div>';
+                    resultsDiv.classList.remove('hidden');
+                }
+            } catch (error) {
+                console.error('Error searching customers:', error);
                 resultsDiv.classList.add('hidden');
             }
-        } catch (error) {
-            console.error('Error searching customers:', error);
-            resultsDiv.classList.add('hidden');
-        }
+        }, 300);
     }
 
     /**

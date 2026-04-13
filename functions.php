@@ -7224,9 +7224,9 @@ function ruiyi_pos_get_order_history() {
         $invoice_customer_name = $order->get_meta('_invoice_customer_name') ?: '';
         $invoice_customer_company = $order->get_meta('_invoice_customer_company') ?: $order->get_meta('_invoice_company') ?: $order->get_billing_company() ?: '';
         $invoice_customer_cif = $order->get_meta('_invoice_customer_cif') ?: $order->get_meta('_invoice_cif') ?: $order->get_meta('_billing_cif') ?: '';
-        $invoice_customer_address = $order->get_meta('_invoice_customer_address') ?: $order->get_meta('_invoice_address') ?: '';
-        $invoice_customer_city = $order->get_meta('_invoice_customer_city') ?: $order->get_meta('_invoice_city') ?: '';
-        $invoice_customer_postcode = $order->get_meta('_invoice_customer_postcode') ?: $order->get_meta('_invoice_postcode') ?: '';
+        $invoice_customer_address = $order->get_meta('_invoice_customer_address') ?: $order->get_meta('_invoice_address') ?: $order->get_billing_address_1() ?: '';
+        $invoice_customer_city = $order->get_meta('_invoice_customer_city') ?: $order->get_meta('_invoice_city') ?: $order->get_billing_city() ?: '';
+        $invoice_customer_postcode = $order->get_meta('_invoice_customer_postcode') ?: $order->get_meta('_invoice_postcode') ?: $order->get_billing_postcode() ?: '';
 
         // 🔥 POS退货订单标记
         $is_pos_refund = $order->get_meta('_pos_refund_order') === 'yes';
@@ -11830,4 +11830,95 @@ function ruiyi_retail_settlement_admin_page() {
         </script>
     </div>
     <?php
+}
+
+/**
+ * 🔥 修复已取消订单的发票PDF下载
+ * 拦截 Verifactu 插件的下载处理，对已取消订单直接读取存储的PDF文件
+ * 优先级 5（比插件默认的 10 更早执行）
+ */
+add_action('admin_post_verifactu_invoice_pdf', 'ruiyi_fix_cancelled_order_pdf_download', 5);
+function ruiyi_fix_cancelled_order_pdf_download() {
+    $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
+    if (!$order_id) return; // 让插件处理
+
+    $order = wc_get_order($order_id);
+    if (!$order) return;
+
+    // 只对已取消订单做特殊处理
+    if ($order->get_status() !== 'cancelled') return;
+
+    $nonce = isset($_GET['nonce']) ? sanitize_text_field($_GET['nonce']) : '';
+    if (!wp_verify_nonce($nonce, 'verifactu_invoice_pdf_' . $order_id)) return;
+
+    // 判断要下载的是原发票还是退货发票
+    $pdf_type = isset($_GET['pdf_type']) ? sanitize_key($_GET['pdf_type']) : '';
+
+    // 确定 meta key
+    if ($pdf_type === 'rectificativa') {
+        $meta_key = '_verifactu_rectificativa_pdf';
+        $label_meta = '_verifactu_rectificativa_label';
+    } else {
+        $meta_key = '_verifactu_invoice_pdf';
+        $label_meta = '_verifactu_invoice_label';
+    }
+
+    $stored_path = $order->get_meta($meta_key);
+
+    // 🔥 修复旧 Hostinger 路径 → 新 VPS 路径
+    if ($stored_path && strpos($stored_path, '/home/u344817861/') === 0) {
+        $stored_path = str_replace(
+            '/home/u344817861/domains/ruiyipos.es/public_html',
+            '/var/www/ruiyipos',
+            $stored_path
+        );
+    }
+
+    if ($stored_path && is_readable($stored_path)) {
+        $label = (string) $order->get_meta($label_meta);
+        $filename = ($label && $label !== 'Pending') ? strtolower($label) . '.pdf' : basename($stored_path);
+
+        while (ob_get_level() > 0) ob_end_clean();
+        nocache_headers();
+        header('Content-Type: application/pdf');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Content-Length: ' . filesize($stored_path));
+        readfile($stored_path);
+        exit;
+    }
+
+    // 🔥 存储的PDF找不到，尝试用 Verifactu 重新生成（绕过 completed 状态检查）
+    if (class_exists('WC_Verifactu_QR')) {
+        $verifactu = WC_Verifactu_QR::instance();
+        $qr_base64 = $order->get_meta('_verifactu_qr_base64');
+        $pngBytes = $qr_base64 ? base64_decode($qr_base64, true) : '';
+
+        if ($verifactu && method_exists($verifactu, 'generate_pdf_with_qr')) {
+            try {
+                $method = new ReflectionMethod($verifactu, 'generate_pdf_with_qr');
+                $method->setAccessible(true);
+                $pdf = $method->invoke($verifactu, $order, $pngBytes ?: '');
+
+                if ($pdf && strlen($pdf) > 100) {
+                    $label = (string) $order->get_meta($label_meta);
+                    $filename = ($label && $label !== 'Pending') ? strtolower($label) . '.pdf' : 'invoice.pdf';
+
+                    while (ob_get_level() > 0) ob_end_clean();
+                    nocache_headers();
+                    header('Content-Type: application/pdf');
+                    header('Content-Disposition: attachment; filename="' . $filename . '"');
+                    header('Content-Length: ' . strlen($pdf));
+                    echo $pdf;
+                    exit;
+                }
+            } catch (Exception $e) {
+                // 记录错误，继续让插件处理
+                if (function_exists('ruiyi_pos_log')) {
+                    ruiyi_pos_log('[Cancelled PDF Fix] Error: ' . $e->getMessage());
+                }
+            }
+        }
+    }
+
+    // 如果以上都失败，让插件的原始处理器接管
 }
