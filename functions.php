@@ -7277,6 +7277,21 @@ function ruiyi_pos_get_order_history() {
         );
     }
 
+    // 🔥 按发票号降序排序（FAC-2026-000031, 000030, 000029...）
+    usort($formatted_orders, function($a, $b) {
+        $labelA = $a['invoice_label'] ?: '';
+        $labelB = $b['invoice_label'] ?: '';
+        // 有发票号的排在前面，都有则按发票号降序
+        if ($labelA && $labelB) {
+            return strcmp($labelB, $labelA);
+        }
+        // 有发票号的排前面
+        if ($labelA) return -1;
+        if ($labelB) return 1;
+        // 都没有发票号按订单ID降序
+        return $b['id'] - $a['id'];
+    });
+
     wp_send_json_success(array(
         'orders' => $formatted_orders,
         'total' => count($formatted_orders)
