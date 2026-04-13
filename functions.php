@@ -7216,8 +7216,9 @@ function ruiyi_pos_get_order_history() {
         }
 
         // Rectificativa PDF - 使用admin-post动态生成
+        // 🔥 修复：必须带 pdf_type=rectificativa 参数，否则会下载原发票
         if ($order->get_meta('_verifactu_rectificativa_label') || $order->get_meta('_verifactu_corrective_generated') === 'yes') {
-            $rectificativa_pdf_url = admin_url('admin-post.php?action=verifactu_invoice_pdf&order_id=' . $order->get_id() . '&nonce=' . wp_create_nonce('verifactu_invoice_pdf_' . $order->get_id()));
+            $rectificativa_pdf_url = admin_url('admin-post.php?action=verifactu_invoice_pdf&pdf_type=rectificativa&order_id=' . $order->get_id() . '&nonce=' . wp_create_nonce('verifactu_invoice_pdf_' . $order->get_id()));
         }
 
         // 🔥 获取发票客户信息 (用于退货单自动填充)
