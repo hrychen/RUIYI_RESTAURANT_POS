@@ -18730,6 +18730,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         if (typeof ruiyiLogTerrazaDebug === 'function') {
           ruiyiLogTerrazaDebug('viewTableOrder:ajax-request', {
             table_number: tableNum,
+            table_global_number: resolvedTable,
             originalTableNumber: tableNumber,
             fallbackOrderId,
             resolved: resolvedTable,
@@ -18741,6 +18742,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         const requestBody = new URLSearchParams({
           action: 'ruiyi_pos_get_table_orders',
           table_number: tableNum,
+          table_global_number: resolvedTable || '',
           nonce: currentNonce
         });
         if (fallbackOrderId && !String(fallbackOrderId).startsWith('OFFLINE_') && !String(fallbackOrderId).startsWith('PENDING_')) {
@@ -18778,6 +18780,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             orderCount: data.data?.orders?.length || 0,
             count: data.data?.count || 0,
             tableNumberProcessed: data.data?.table_number_processed || null,
+            tableGlobalNumber: data.data?.table_global_number || null,
             message: data.data?.message || data.message || null,
             orders: (data.data?.orders || []).map(order => ({
               id: order.id,

@@ -10238,6 +10238,9 @@ function ruiyi_pos_get_orders_for_table_callback() {
 
     // 2. 获取并清理参数
     $table_number_input = isset($_POST['table_number']) ? sanitize_text_field($_POST['table_number']) : '';
+    $explicit_global_table_number = isset($_POST['table_global_number'])
+        ? preg_replace('/[^0-9]/', '', sanitize_text_field($_POST['table_global_number']))
+        : '';
     $fallback_order_id_input = isset($_POST['order_id']) ? absint($_POST['order_id']) : 0;
 
     if (empty($table_number_input)) {
@@ -10253,6 +10256,9 @@ function ruiyi_pos_get_orders_for_table_callback() {
     $table_number_numeric = function_exists('ruiyi_safe_extract_table_number')
         ? ruiyi_safe_extract_table_number($table_number_input, $all_mappings)
         : '';
+    if ($explicit_global_table_number !== '') {
+        $table_number_numeric = $explicit_global_table_number;
+    }
     if ($table_number_numeric === '') {
         $table_number_numeric = preg_replace('/[^0-9]/', '', $table_number_input);
     }
@@ -10263,7 +10269,7 @@ function ruiyi_pos_get_orders_for_table_callback() {
     // 当桌位使用自定义名称（如 "T4", "W21", "厅9.5"）时，preg_replace 提取的数字
     // 不是全局编号。需要通过映射表将自定义名称解析为正确的全局编号。
     // 例如：T4 → preg_replace 提取 "4"，但全局编号是 16
-    if (!empty($all_mappings)) {
+    if ($explicit_global_table_number === '' && !empty($all_mappings)) {
         $input_normalized = strtoupper(preg_replace('/\s+/', '', trim($table_number_input)));
 
         foreach ($all_mappings as $mapping) {
@@ -10287,7 +10293,7 @@ function ruiyi_pos_get_orders_for_table_callback() {
         return;
     }
 
-    ruiyi_debug_log("处理后的桌位号: 完整='{$table_full_name}', 前缀='{$table_prefix}', 数字='{$table_number_numeric}'");
+    ruiyi_debug_log("处理后的桌位号: 完整='{$table_full_name}', 前缀='{$table_prefix}', 数字='{$table_number_numeric}', 显式全局编号='{$explicit_global_table_number}'");
 
     // 🔥 兜底：桌位状态表里保存的 orderId 是最接近前端"占用卡片"的数据源。
     // 如果订单 meta 中的桌号因旧映射损坏而不匹配，后面会用这里的 orderId 找回订单。
@@ -10586,6 +10592,7 @@ function ruiyi_pos_get_orders_for_table_callback() {
     wp_send_json_success([
         'table_number_requested' => $table_number_input, // 返回请求的原始桌号
         'table_number_processed' => $table_number_numeric,     // 返回处理后的桌号数字
+        'table_global_number' => $explicit_global_table_number ?: $table_number_numeric,
         'orders' => $orders_for_this_table,
         'count' => count($orders_for_this_table)
     ]);
