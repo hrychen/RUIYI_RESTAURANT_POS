@@ -5556,6 +5556,45 @@ function ruiyi_get_tables_status() {
             }
 
             // 没有真实订单 → 僵尸条目，移除
+            if ($real_order_count === 0 && !empty($data['orderId'])) {
+                $direct_order = wc_get_order(absint($data['orderId']));
+                if ($direct_order && in_array($direct_order->get_status(), RUIYI_POS_ACTIVE_ORDER_STATUSES, true)) {
+                    $direct_post = get_post($direct_order->get_id());
+                    $direct_is_trash = $direct_post && $direct_post->post_status === 'trash';
+                    $direct_is_merged = $direct_order->get_meta('_is_merged') === 'yes';
+
+                    if (!$direct_is_trash && !$direct_is_merged) {
+                        $real_order_count = 1;
+                        $real_total = floatval($direct_order->get_total());
+                        $real_latest_order_id = $direct_order->get_id();
+
+                        $repaired_table_number = 'Mesa ' . $table_num_digits;
+                        $old_direct_table = $direct_order->get_meta('_table_number', true);
+                        $old_direct_numeric = ruiyi_safe_extract_table_number($old_direct_table, $all_table_mappings);
+                        if ($old_direct_numeric !== $table_num_digits) {
+                            $direct_order->update_meta_data('_table_number', $repaired_table_number);
+                            $direct_order->update_meta_data('table_number', $repaired_table_number);
+                            if (!empty($all_table_mappings)) {
+                                foreach ($all_table_mappings as $_repair_mapping) {
+                                    if (strval($_repair_mapping['global_table_number'] ?? '') === strval($table_num_digits)) {
+                                        $repair_display = trim((string)($_repair_mapping['category_display_name'] ?? ''));
+                                        if ($repair_display !== '') {
+                                            $direct_order->update_meta_data('_table_display_name', $repair_display);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            $direct_order->save();
+                            ruiyi_debug_log("[桌位状态轮询] ✓ 通过 live orderId 修复订单 #{$real_latest_order_id} 桌号 meta: '{$old_direct_table}' → '{$repaired_table_number}'");
+                        } else {
+                            ruiyi_debug_log("[桌位状态轮询] ✓ 通过 live orderId 保留桌位占用: table='{$table_number}', orderId={$real_latest_order_id}");
+                        }
+                    }
+                }
+            }
+
+            // 没有真实订单 → 僵尸条目，移除
             if ($real_order_count === 0) {
                 ruiyi_debug_log("[桌位状态轮询] 🧹 自动清理僵尸桌位: key='{$table_number}', storedOrderId=" . ($data['orderId'] ?? 'null') . ", storedTotal=" . ($data['total'] ?? 0));
                 unset($live_statuses[$table_number]);
@@ -10232,6 +10271,28 @@ function ruiyi_pos_get_orders_for_table_callback() {
 
     ruiyi_debug_log("处理后的桌位号: 完整='{$table_full_name}', 前缀='{$table_prefix}', 数字='{$table_number_numeric}'");
 
+    // 🔥 兜底：桌位状态表里保存的 orderId 是最接近前端"占用卡片"的数据源。
+    // 如果订单 meta 中的桌号因旧映射损坏而不匹配，后面会用这里的 orderId 找回订单。
+    $live_order_ids_for_table = array();
+    $live_statuses_for_lookup = get_option('ruiyi_pos_live_table_statuses', array());
+    if (is_array($live_statuses_for_lookup)) {
+        foreach ($live_statuses_for_lookup as $live_table_key => $live_status_data) {
+            if (!is_array($live_status_data) || empty($live_status_data['orderId'])) {
+                continue;
+            }
+            $live_table_numeric = function_exists('ruiyi_safe_extract_table_number')
+                ? ruiyi_safe_extract_table_number($live_table_key, $all_mappings)
+                : preg_replace('/[^0-9]/', '', $live_table_key);
+            if ($live_table_numeric === $table_number_numeric) {
+                $live_order_ids_for_table[] = absint($live_status_data['orderId']);
+            }
+        }
+        $live_order_ids_for_table = array_values(array_unique(array_filter($live_order_ids_for_table)));
+    }
+    if (!empty($live_order_ids_for_table)) {
+        ruiyi_debug_log("桌位 {$table_number_numeric} 的 live status 兜底订单ID: " . implode(',', $live_order_ids_for_table));
+    }
+
     // 🔥🔥🔥 关键修复：使用统一的活跃订单状态常量
     // 包含 pending, on-hold, processing 三种状态
     $unpaid_statuses = RUIYI_POS_ACTIVE_ORDER_STATUSES;
@@ -10356,6 +10417,29 @@ function ruiyi_pos_get_orders_for_table_callback() {
                 // 这处理了从客户点餐页面创建的订单可能存储为错误格式的情况
                 $is_match = true;
                 $match_type = "默认前缀搜索-数字匹配（订单桌号前缀:{$order_table_prefix}）";
+            } elseif (!$is_match && !empty($live_order_ids_for_table) && in_array(absint($order->get_id()), $live_order_ids_for_table, true)) {
+                // 🔥🔥🔥 【2026-05-05 修复】桌位映射损坏后的订单兜底匹配
+                // 场景：桌位卡片显示占用（live status 有 orderId），WC 后台也有 processing 订单，
+                // 但订单 _table_number 仍是旧映射桌号，点击桌位按当前映射查询就会显示"无订单"。
+                $is_match = true;
+                $match_type = "live status orderId 兜底匹配";
+
+                $repaired_table_number = 'Mesa ' . $table_number_numeric;
+                $order->update_meta_data('_table_number', $repaired_table_number);
+                $order->update_meta_data('table_number', $repaired_table_number);
+                if (!empty($all_mappings)) {
+                    foreach ($all_mappings as $_repair_mapping) {
+                        if (strval($_repair_mapping['global_table_number'] ?? '') === strval($table_number_numeric)) {
+                            $repair_display = trim((string)($_repair_mapping['category_display_name'] ?? ''));
+                            if ($repair_display !== '') {
+                                $order->update_meta_data('_table_display_name', $repair_display);
+                            }
+                            break;
+                        }
+                    }
+                }
+                $order->save();
+                ruiyi_debug_log("✓ live status 兜底修复订单 #{$order->get_id()} 桌号 meta: '{$order_table_meta}' → '{$repaired_table_number}'");
             }
 
             if (!$is_match) {
