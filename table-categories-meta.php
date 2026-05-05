@@ -383,10 +383,28 @@ class RUIYI_Table_Meta_Manager {
             return strcmp(strval($a['table_id'] ?? ''), strval($b['table_id'] ?? ''));
         });
 
+        $global_number_counts = array();
+        $max_global_number = 0;
+        foreach ($mappings as $mapping) {
+            if (!is_array($mapping)) {
+                continue;
+            }
+            $global_number = intval($mapping['global_table_number'] ?? 0);
+            if ($global_number <= 0) {
+                continue;
+            }
+            if (!isset($global_number_counts[$global_number])) {
+                $global_number_counts[$global_number] = 0;
+            }
+            $global_number_counts[$global_number]++;
+            $max_global_number = max($max_global_number, $global_number);
+        }
+
         $used_local_numbers = array();
+        $used_global_numbers = array();
         $next_local_number = array();
+        $next_global_number = max(1, $max_global_number + 1);
         $repaired_mappings = array();
-        $global_counter = 1;
 
         foreach ($mappings as $mapping) {
             if (!is_array($mapping)) {
@@ -426,9 +444,22 @@ class RUIYI_Table_Meta_Manager {
                 $issues['fixed_table_ids']++;
             }
 
-            if (intval($mapping['global_table_number'] ?? 0) !== $global_counter) {
+            $current_global_number = intval($mapping['global_table_number'] ?? 0);
+            $global_number_is_valid = $current_global_number > 0 &&
+                ($global_number_counts[$current_global_number] ?? 0) === 1 &&
+                !isset($used_global_numbers[$current_global_number]);
+
+            if ($global_number_is_valid) {
+                $stable_global_number = $current_global_number;
+            } else {
                 $issues['fixed_global_numbers']++;
+                while (isset($used_global_numbers[$next_global_number]) || isset($global_number_counts[$next_global_number])) {
+                    $next_global_number++;
+                }
+                $stable_global_number = $next_global_number;
+                $next_global_number++;
             }
+            $used_global_numbers[$stable_global_number] = true;
 
             $category_name = $this->get_category_name_by_lang($category_by_id[$category_id]);
             $expected_display_name = trim($category_name . ' ' . $local_number);
@@ -455,13 +486,12 @@ class RUIYI_Table_Meta_Manager {
 
             $mapping['category_id'] = $category_id;
             $mapping['table_number_in_category'] = $local_number;
-            $mapping['global_table_number'] = $global_counter;
+            $mapping['global_table_number'] = $stable_global_number;
             $mapping['table_id'] = $expected_table_id;
-            $mapping['table_number'] = $this->generate_table_name($global_counter);
+            $mapping['table_number'] = $this->generate_table_name($stable_global_number);
             $mapping['updated_at'] = current_time('mysql');
 
             $repaired_mappings[] = $mapping;
-            $global_counter++;
         }
 
         if (serialize($repaired_mappings) !== $original_serialized || $force) {
@@ -513,47 +543,12 @@ class RUIYI_Table_Meta_Manager {
 
     /**
      * 重新计算所有分类的全局桌位编号
-     * 确保分类按顺序分配全局编号
+     * 兼容旧调用：现在不再重新洗牌所有全局桌号，只修复缺失/重复/孤儿映射。
+     * 原来的全量重排会改变已有 WooCommerce 订单对应的桌位身份，导致串单。
      */
     public function recalculate_global_numbers() {
-        $categories = $this->get_categories();
-        $mappings = $this->get_mappings();
-
-        // 按分类的sort_order排序
-        usort($categories, function($a, $b) {
-            return intval($a['sort_order']) - intval($b['sort_order']);
-        });
-
-        $global_counter = 1;
-        $updated_mappings = array();
-
-        // 按分类顺序重新分配全局编号
-        foreach ($categories as $category) {
-            $category_tables = array();
-
-            // 收集该分类的所有桌位
-            foreach ($mappings as $mapping) {
-                if (intval($mapping['category_id']) === intval($category['id'])) {
-                    $category_tables[] = $mapping;
-                }
-            }
-
-            // 按分类内编号排序
-            usort($category_tables, function($a, $b) {
-                return intval($a['table_number_in_category']) - intval($b['table_number_in_category']);
-            });
-
-            // 重新分配全局编号
-            foreach ($category_tables as $table) {
-                $table['global_table_number'] = $global_counter;
-                $table['table_number'] = $this->generate_table_name($global_counter);
-                $updated_mappings[] = $table;
-                $global_counter++;
-            }
-        }
-
-        // 保存更新后的映射
-        return $this->save_mappings($updated_mappings);
+        $mappings = $this->maybe_repair_mappings(null, true);
+        return is_array($mappings);
     }
 
     /**
@@ -615,9 +610,8 @@ class RUIYI_Table_Meta_Manager {
         ruiyi_debug_log("RUIYI Meta: Attempting to save " . count($mappings) . " mappings");
 
         if ($this->save_mappings($mappings)) {
-            // 重新计算全局编号以确保按分类顺序分配
-            $this->recalculate_global_numbers();
-            ruiyi_debug_log("RUIYI Meta: Successfully saved mappings and recalculated global numbers, returning {$success_count}");
+            $this->maybe_repair_mappings(null, true);
+            ruiyi_debug_log("RUIYI Meta: Successfully saved mappings and repaired mapping integrity, returning {$success_count}");
             return $success_count;
         }
 
