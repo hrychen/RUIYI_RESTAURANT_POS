@@ -18350,7 +18350,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
     // 🔥 当前正在查看的桌位全局编号（防止异步回调加载错误桌位数据）
     window._currentViewingTable = null;
 
-    function viewTableOrder(tableNumber) {
+    function viewTableOrder(tableNumber, fallbackOrderId = null) {
       // 🔥 记录当前查看的桌位，异步回调会检查此值
       var resolvedTable = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
         ? ruiyiSafeResolveGlobalTableNumber(tableNumber)
@@ -18726,25 +18726,31 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       // 🔥 关键修复：使用带 Nonce 自动刷新重试的函数
       async function fetchTableOrdersWithRetry(tableNum, retryCount = 0) {
         // 获取最新的 nonce
-        const currentNonce = (window.NonceManager && window.NonceManager.get()) || ajaxNonce;
+          const currentNonce = (window.NonceManager && window.NonceManager.get()) || ajaxNonce;
         if (typeof ruiyiLogTerrazaDebug === 'function') {
           ruiyiLogTerrazaDebug('viewTableOrder:ajax-request', {
             table_number: tableNum,
             originalTableNumber: tableNumber,
+            fallbackOrderId,
             resolved: resolvedTable,
             retryCount,
             currentViewingTable: window._currentViewingTable
           });
         }
 
+        const requestBody = new URLSearchParams({
+          action: 'ruiyi_pos_get_table_orders',
+          table_number: tableNum,
+          nonce: currentNonce
+        });
+        if (fallbackOrderId && !String(fallbackOrderId).startsWith('OFFLINE_') && !String(fallbackOrderId).startsWith('PENDING_')) {
+          requestBody.append('order_id', String(fallbackOrderId));
+        }
+
         const response = await fetch(ajaxUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            action: 'ruiyi_pos_get_table_orders',
-            table_number: tableNum,
-            nonce: currentNonce
-          })
+          body: requestBody
         });
 
         if (!response.ok) {
@@ -22348,6 +22354,9 @@ ${window.RUIYI_TRANS.createLayout}
         }
         mesaElement.setAttribute('data-mesa', mesaId);
         mesaElement.setAttribute('data-estado', estado);
+        if (estadoMesa && estadoMesa.orderId) {
+          mesaElement.setAttribute('data-order-id', estadoMesa.orderId);
+        }
         
         // 获取显示名称：分类过滤时显示分类名称，全部显示时显示Mesa编号
         const tableDisplayName = displayName || mesaId;
@@ -22614,6 +22623,7 @@ ${window.RUIYI_TRANS.createLayout}
 
           const mesaSeleccionada = element.getAttribute('data-mesa');
           const estadoMesa = element.getAttribute('data-estado');
+          const fallbackOrderId = element.getAttribute('data-order-id') || null;
 
           // 🔥 点击桌位时隐藏桌位模块的上一单信息
           if (typeof hideMesasLastOrderInfo === 'function') {
@@ -22628,7 +22638,7 @@ ${window.RUIYI_TRANS.createLayout}
           
           // 如果桌位是占用状态或结算中状态，直接调用查看功能
           if (estadoMesa === 'ocupada' || estadoMesa === 'solicitud_cuenta' || estadoMesa === 'liquidando') {
-            viewTableOrder(mesaSeleccionada);
+            viewTableOrder(mesaSeleccionada, fallbackOrderId);
             return;
           }
 
@@ -22711,9 +22721,11 @@ ${window.RUIYI_TRANS.createLayout}
         // 添加查看按钮事件
         mesaElement.querySelector('.ver-mesa')?.addEventListener('click', function(e) {
           e.stopPropagation();
-          const mesa = this.closest('.mesa-item').getAttribute('data-mesa');
+          const item = this.closest('.mesa-item');
+          const mesa = item.getAttribute('data-mesa');
+          const fallbackOrderId = item.getAttribute('data-order-id') || null;
           // 调用查看桌位订单功能
-          viewTableOrder(mesa);
+          viewTableOrder(mesa, fallbackOrderId);
         });
         
         // 添加释放按钮事件

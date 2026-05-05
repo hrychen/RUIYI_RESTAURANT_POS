@@ -10221,6 +10221,7 @@ function ruiyi_pos_get_orders_for_table_callback() {
 
     // 2. 获取并清理参数
     $table_number_input = isset($_POST['table_number']) ? sanitize_text_field($_POST['table_number']) : '';
+    $fallback_order_id_input = isset($_POST['order_id']) ? absint($_POST['order_id']) : 0;
 
     if (empty($table_number_input)) {
         wp_send_json_error(['message' => ruiyi_translate('Número de mesa no proporcionado.', 'Table number not provided.', '未提供桌位号。')], 400);
@@ -10274,6 +10275,10 @@ function ruiyi_pos_get_orders_for_table_callback() {
     // 🔥 兜底：桌位状态表里保存的 orderId 是最接近前端"占用卡片"的数据源。
     // 如果订单 meta 中的桌号因旧映射损坏而不匹配，后面会用这里的 orderId 找回订单。
     $live_order_ids_for_table = array();
+    if ($fallback_order_id_input > 0) {
+        $live_order_ids_for_table[] = $fallback_order_id_input;
+        ruiyi_debug_log("桌位 {$table_number_numeric} 的前端兜底订单ID: {$fallback_order_id_input}");
+    }
     $live_statuses_for_lookup = get_option('ruiyi_pos_live_table_statuses', array());
     if (is_array($live_statuses_for_lookup)) {
         foreach ($live_statuses_for_lookup as $live_table_key => $live_status_data) {
