@@ -3910,6 +3910,71 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
     }
     window.ruiyiSafeResolveGlobalTableNumber = ruiyiSafeResolveGlobalTableNumber;
 
+    function ruiyiGetTerrazaDebugInfo(tableNumber) {
+        const raw = String(tableNumber ?? '').trim();
+        const resolved = raw
+            ? (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+                ? ruiyiSafeResolveGlobalTableNumber(raw)
+                : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(raw) : raw))
+            : '';
+        const mappingsRaw = window.tableCategoryMappings || {};
+        const mappings = Array.isArray(mappingsRaw) ? mappingsRaw : Object.values(mappingsRaw || {});
+        const normalize = (value) => String(value ?? '').replace(/\s+/g, '').toUpperCase();
+        const rawNorm = normalize(raw);
+        const resolvedNorm = normalize(resolved);
+        const mapping = mappings.find((m) => {
+            const globalNumber = normalize(m && m.global_table_number);
+            const localNumber = normalize(m && m.local_table_number);
+            const categoryName = normalize(m && m.category_name);
+            const categoryDisplay = normalize(m && m.category_display_name);
+            const displayName = normalize(m && m.display_name);
+            return (resolvedNorm && globalNumber === resolvedNorm) ||
+                (rawNorm && (
+                    rawNorm === globalNumber ||
+                    rawNorm === localNumber ||
+                    rawNorm === categoryDisplay ||
+                    rawNorm === displayName ||
+                    rawNorm === `${categoryName}${localNumber}` ||
+                    rawNorm === `${categoryDisplay}${localNumber}`
+                ));
+        }) || null;
+        const label = [
+            raw,
+            resolved,
+            mapping?.category_name,
+            mapping?.category_display_name,
+            mapping?.display_name
+        ].filter(Boolean).join('|').toUpperCase();
+
+        return {
+            raw,
+            resolved,
+            mapping,
+            isTerraza: label.includes('TERRAZA')
+        };
+    }
+
+    function ruiyiLogTerrazaDebug(stage, payload = {}) {
+        try {
+            const tableValue = payload.table_number ||
+                payload.tableNumber ||
+                payload.tableNum ||
+                payload.table ||
+                payload.raw ||
+                document.getElementById('table-number')?.value ||
+                '';
+            const info = ruiyiGetTerrazaDebugInfo(tableValue);
+            if (!info.isTerraza) {
+                return;
+            }
+            console.log('[TERRAZA-DEBUG] ' + stage, Object.assign({ tableDebug: info }, payload));
+        } catch (error) {
+            console.warn('[TERRAZA-DEBUG] log failed:', stage, error);
+        }
+    }
+    window.ruiyiGetTerrazaDebugInfo = ruiyiGetTerrazaDebugInfo;
+    window.ruiyiLogTerrazaDebug = ruiyiLogTerrazaDebug;
+
     // 🔥🔥🔥 收银模块购物车持久化功能 - 刷新页面保留购物车内容
     const POS_CART_STORAGE_KEY = 'pos_cashier_cart';
 
@@ -10369,6 +10434,22 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       const _normalizedTableNum = (_resolvedTableNum && /^\d+$/.test(String(_resolvedTableNum)))
         ? String(_resolvedTableNum)
         : _fallbackStrip;
+      if (typeof ruiyiLogTerrazaDebug === 'function') {
+        ruiyiLogTerrazaDebug('quickSaveTableOrder:resolved-table', {
+          table_number,
+          resolved: _resolvedTableNum,
+          normalized: _normalizedTableNum,
+          fallbackStrip: _fallbackStrip,
+          currentViewingTable: window._currentViewingTable,
+          newItems: newItems.map(item => ({
+            id: item.id,
+            name: item.name,
+            quantity: item.quantity,
+            price: item.customPrice !== undefined ? item.customPrice : item.price,
+            locked: !!item.locked
+          }))
+        });
+      }
       if (typeof ruiyiSetCartTableIdentity === 'function') {
         ruiyiSetCartTableIdentity(_normalizedTableNum, 'quickSaveTableOrder');
       }
@@ -10415,6 +10496,14 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
       const tableNum = _normalizedTableNum;
       const mesaKey = `Mesa ${tableNum}`;
+      if (typeof ruiyiLogTerrazaDebug === 'function') {
+        ruiyiLogTerrazaDebug('quickSaveTableOrder:local-state-key', {
+          table_number,
+          tableNum,
+          mesaKey,
+          existingKeys: Object.keys(mesasEstado).filter(key => key.includes(tableNum) || key.toUpperCase().includes('TERRAZA')).slice(0, 20)
+        });
+      }
 
       // 清理旧格式条目
       ['餐桌', 'Table'].forEach(prefix => {
@@ -10536,6 +10625,19 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       };
 
       localStorage.setItem('mesas_estado', JSON.stringify(mesasEstado));
+      if (typeof ruiyiLogTerrazaDebug === 'function') {
+        ruiyiLogTerrazaDebug('quickSaveTableOrder:saved-local-state', {
+          table_number,
+          tableNum,
+          mesaKey,
+          orderId: mesasEstado[mesaKey]?.orderId,
+          total: mesasEstado[mesaKey]?.total,
+          pendingSync: mesasEstado[mesaKey]?._pendingSync,
+          offline: mesasEstado[mesaKey]?._offline,
+          localCartCount: mesasEstado[mesaKey]?.cart?.length || 0,
+          pendingItemCount: mesasEstado[mesaKey]?._offlineNewItems?.length || 0
+        });
+      }
 
       // 🔥【2026-04-03 修复】移除 waiter_order_created_trigger
       // POS 自身创建的订单不需要触发"新订单"通知
@@ -11070,6 +11172,26 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         if (syncBuffetItems.length > 0) {
           formData.append('buffet_items', JSON.stringify(syncBuffetItems));
         }
+        if (typeof ruiyiLogTerrazaDebug === 'function') {
+          ruiyiLogTerrazaDebug('syncTableOrderToServer:request', {
+            table_number: orderData.table_number,
+            tableNum: orderData.tableNum,
+            mesaKey: orderData.mesaKey,
+            currentViewingTable: window._currentViewingTable,
+            resolved: typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+              ? ruiyiSafeResolveGlobalTableNumber(orderData.table_number)
+              : null,
+            isAddition: !!orderData.isAddition,
+            regularItemCount: syncRegularItems.length,
+            buffetItemCount: syncBuffetItems.length,
+            items: syncRegularItems.map(item => ({
+              id: item.id,
+              name: item.name,
+              quantity: item.quantity,
+              price: item.customPrice !== undefined ? item.customPrice : item.price
+            }))
+          });
+        }
 
         // 🔥 【2026-03-10 修复】附带外送客户信息到订单
         // 确保保存桌位订单时，客户电话/地址等信息也存入 WC 订单 meta
@@ -11108,6 +11230,18 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
         const data = await response.json();
         console.log('[🔍syncTableOrder调试] 📥 服务器响应:', data.success ? '成功' : '失败');
+        if (typeof ruiyiLogTerrazaDebug === 'function') {
+          ruiyiLogTerrazaDebug('syncTableOrderToServer:response', {
+            table_number: orderData.table_number,
+            tableNum: orderData.tableNum,
+            mesaKey: orderData.mesaKey,
+            success: !!data.success,
+            orderId: data.data?.order_id || data.order_id || null,
+            total: data.data?.total || data.total || null,
+            message: data.data?.message || data.message || null,
+            raw: data
+          });
+        }
 
         if (data.success) {
           const realOrderId = data.data?.order_id || data.order_id;
@@ -11198,9 +11332,12 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             // 🔥 但必须检查用户是否仍在同一桌位，否则会污染新桌位的购物车
             // 🔥🔥🔥 【2026-03-29 关键修复】当 _currentViewingTable 为 null（用户已离开桌位）时也必须跳过
             // 原 bug：guard 用 `_currentViewingTable && mismatch`，null 时条件为 false，导致 else 分支将旧桌位商品 push 到 cart
-            var _syncTableNum = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+            var _syncTableNumRaw = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
               ? ruiyiSafeResolveGlobalTableNumber(orderData.table_number)
               : resolveGlobalTableNumber(orderData.table_number);
+            var _syncTableNum = _syncTableNumRaw !== null && _syncTableNumRaw !== undefined
+              ? String(_syncTableNumRaw)
+              : '';
             if (!window._currentViewingTable || _syncTableNum !== window._currentViewingTable) {
               console.warn('[syncTableOrder] ⚠️ 用户已切换桌位或离开桌位 (sync:' + _syncTableNum + ' current:' + window._currentViewingTable + ')，跳过购物车更新');
             } else if (orderData.newItems && orderData.newItems.length > 0) {
@@ -13721,7 +13858,21 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       if (saveTableOrderBtn) {
         saveTableOrderBtn.addEventListener('click', async function() {
           // 🔥 保存开始时记录桌位，用于异步回调中检查
-          const _saveStartTable = window._currentViewingTable;
+          let _saveStartTable = window._currentViewingTable ? String(window._currentViewingTable) : null;
+          const _saveInputTable = document.getElementById('table-number')?.value.trim();
+          const _saveResolvedTableRaw = _saveInputTable
+            ? (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+                ? ruiyiSafeResolveGlobalTableNumber(_saveInputTable)
+                : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(_saveInputTable) : null))
+            : null;
+          const _saveResolvedTable = _saveResolvedTableRaw !== null && _saveResolvedTableRaw !== undefined
+            ? String(_saveResolvedTableRaw)
+            : '';
+          if (!_saveStartTable && _saveResolvedTable) {
+            window._currentViewingTable = _saveResolvedTable;
+            _saveStartTable = _saveResolvedTable;
+            console.log('[saveTableOrderBtn] 🔒 恢复当前桌位上下文:', _saveResolvedTable);
+          }
 
           // 🔥 检查购物车是否为空或只有锁定的旧商品（没有新增商品）
           const hasNewItems = cart && cart.length > 0 && cart.some(item => item.locked !== true);
@@ -18205,6 +18356,13 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         ? ruiyiSafeResolveGlobalTableNumber(tableNumber)
         : resolveGlobalTableNumber(tableNumber);
       tableDebugLog('viewTableOrder', '查看桌位订单', { rawInput: tableNumber, resolved: resolvedTable });
+      if (typeof ruiyiLogTerrazaDebug === 'function') {
+        ruiyiLogTerrazaDebug('viewTableOrder:start', {
+          table_number: tableNumber,
+          resolved: resolvedTable,
+          previousCurrentViewingTable: window._currentViewingTable
+        });
+      }
       window._currentViewingTable = resolvedTable;
 
       // 🔥🔥🔥 【2026-01-30 关键修复】立即清空购物车，防止切换桌位时数据混乱
@@ -18440,6 +18598,22 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         const mesaKeyCheck = `${tablePrefixCheck} ${tableNumberOnlyCheck}`;
         offlineTableStatus = mesasEstadoOnline[mesaKeyCheck] || mesasEstadoOnline[`Mesa ${tableNumberOnlyCheck}`];
       }
+      if (typeof ruiyiLogTerrazaDebug === 'function') {
+        ruiyiLogTerrazaDebug('viewTableOrder:local-status', {
+          table_number: tableNumber,
+          resolved: resolvedTable,
+          tableNumberOnlyCheck,
+          localKey: tableResultOnline.key || null,
+          hasLocalStatus: !!offlineTableStatus,
+          localOrderId: offlineTableStatus?.orderId || null,
+          localTotal: offlineTableStatus?.total || null,
+          pendingSync: offlineTableStatus?._pendingSync || false,
+          offline: offlineTableStatus?._offline || false,
+          skipAutoUpdate: offlineTableStatus?._skipAutoUpdate || false,
+          localCartCount: offlineTableStatus?.cart?.length || 0,
+          localKeys: Object.keys(mesasEstadoOnline).filter(key => key.includes(String(resolvedTable)) || key.toUpperCase().includes('TERRAZA')).slice(0, 20)
+        });
+      }
 
       // 🔥🔥🔥 【2026-01-20 关键修复】如果有未同步的数据，优先使用本地数据
       // 检查两种情况：
@@ -18553,6 +18727,15 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       async function fetchTableOrdersWithRetry(tableNum, retryCount = 0) {
         // 获取最新的 nonce
         const currentNonce = (window.NonceManager && window.NonceManager.get()) || ajaxNonce;
+        if (typeof ruiyiLogTerrazaDebug === 'function') {
+          ruiyiLogTerrazaDebug('viewTableOrder:ajax-request', {
+            table_number: tableNum,
+            originalTableNumber: tableNumber,
+            resolved: resolvedTable,
+            retryCount,
+            currentViewingTable: window._currentViewingTable
+          });
+        }
 
         const response = await fetch(ajaxUrl, {
           method: 'POST',
@@ -18579,6 +18762,25 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         }
 
         const data = await response.json();
+        if (typeof ruiyiLogTerrazaDebug === 'function') {
+          ruiyiLogTerrazaDebug('viewTableOrder:ajax-response', {
+            table_number: tableNum,
+            originalTableNumber: tableNumber,
+            resolved: resolvedTable,
+            retryCount,
+            success: !!data.success,
+            orderCount: data.data?.orders?.length || 0,
+            count: data.data?.count || 0,
+            tableNumberProcessed: data.data?.table_number_processed || null,
+            message: data.data?.message || data.message || null,
+            orders: (data.data?.orders || []).map(order => ({
+              id: order.id,
+              status: order.status,
+              total: order.total,
+              itemCount: order.items?.length || 0
+            }))
+          });
+        }
 
         // 🔥 检查是否是 Nonce 错误的 JSON 响应
         if (!data.success && data.data?.message &&
@@ -18608,6 +18810,17 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           console.log('[viewTableOrder] ✅ 同步等待完成，获取服务器数据');
         }
         const canonicalTableLookup = resolvedTable ? `Mesa ${resolvedTable}` : tableNumber;
+        if (typeof ruiyiLogTerrazaDebug === 'function') {
+          ruiyiLogTerrazaDebug('viewTableOrder:lookup-table', {
+            table_number: canonicalTableLookup,
+            originalTableNumber: tableNumber,
+            resolved: resolvedTable,
+            pendingSyncOnline: _isPendingSyncOnline,
+            localKey: tableResultOnline.key || null,
+            hasLocalStatus: !!offlineTableStatus,
+            localOrderId: offlineTableStatus?.orderId || null
+          });
+        }
         return fetchTableOrdersWithRetry(canonicalTableLookup);
       };
 
