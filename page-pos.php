@@ -4150,6 +4150,32 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         const mappings = Array.isArray(mappingsRaw) ? mappingsRaw : Object.values(mappingsRaw || {});
         const normalize = value => String(value ?? '').replace(/\s+/g, '').toUpperCase();
         const rawNorm = normalize(raw);
+        const canonicalMesaMatch = raw.match(/^Mesa\s*(\d+)$/);
+
+        if (canonicalMesaMatch) {
+            const canonicalGlobal = canonicalMesaMatch[1];
+            const canonicalMapping = mappings.find(m => String(m?.global_table_number ?? '').trim() === canonicalGlobal);
+            if (canonicalMapping) {
+                return String(canonicalMapping.category_display_name || canonicalMapping.display_name || `Mesa ${canonicalGlobal}`).trim();
+            }
+            return fallbackText || raw;
+        }
+
+        const exactMapping = mappings.find(m => {
+            if (!m || !rawNorm) return false;
+            const localNumber = m.local_table_number ?? m.table_number_in_category;
+            const candidates = [
+                m.category_display_name,
+                m.display_name,
+                m.category_name && localNumber !== undefined ? `${m.category_name}${localNumber}` : '',
+                m.category_name && localNumber !== undefined ? `${m.category_name} ${localNumber}` : ''
+            ].filter(Boolean);
+            return candidates.some(candidate => normalize(candidate) === rawNorm);
+        });
+        if (exactMapping) {
+            return String(exactMapping.category_display_name || exactMapping.display_name || raw || fallbackText).trim();
+        }
+
         const globalNumber = raw
             ? (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
                 ? String(ruiyiSafeResolveGlobalTableNumber(raw) || '')
@@ -4159,15 +4185,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         const mapping = mappings.find(m => {
             if (!m) return false;
             const global = String(m.global_table_number ?? '').trim();
-            const candidates = [
-                m.category_display_name,
-                m.display_name,
-                m.table_number,
-                m.category_name && m.local_table_number !== undefined ? `${m.category_name}${m.local_table_number}` : '',
-                m.category_name && m.local_table_number !== undefined ? `${m.category_name} ${m.local_table_number}` : ''
-            ].filter(Boolean);
-            return (globalNumber && global === globalNumber) ||
-                (rawNorm && candidates.some(candidate => normalize(candidate) === rawNorm));
+            return globalNumber && global === globalNumber;
         });
 
         if (mapping) {
