@@ -1236,19 +1236,26 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
               triggerImmediateSyncIfAvailable();
 
+              // 🔥 PWA: 先同步离线清台，避免旧离线订单在恢复网络后重新占用桌位
+              setTimeout(() => {
+                  if (typeof window.syncOfflineTableClears === 'function') {
+                      window.syncOfflineTableClears();
+                  }
+              }, 1500);
+
               // 🔥 PWA: 同步离线桌位订单到服务器
               setTimeout(() => {
                   if (typeof window.syncOfflineTableOrders === 'function') {
                       window.syncOfflineTableOrders();
                   }
-              }, 2000);
+              }, 2500);
 
               // 🔥 PWA: 同步离线锁定商品删除操作到服务器
               setTimeout(() => {
                   if (typeof window.syncOfflineLockedItemDeletions === 'function') {
                       window.syncOfflineLockedItemDeletions();
                   }
-              }, 3000);
+              }, 3500);
 
               // Background Sync as backup
               if ('serviceWorker' in navigator && 'sync' in window.ServiceWorkerRegistration.prototype) {
@@ -1603,6 +1610,107 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
               }
           }
 
+          // 🔥 PWA: 同步离线清空桌位操作到服务器
+          async function syncOfflineTableClears() {
+              const ajaxUrl = window.ajaxUrl || '<?php echo esc_url(admin_url('admin-ajax.php')); ?>';
+              const ajaxNonce = window.RUIYI_POS?.nonce || '<?php echo esc_js($ajax_nonce); ?>';
+              const pendingClears = JSON.parse(localStorage.getItem('pending_table_clears') || '[]');
+
+              if (!navigator.onLine || pendingClears.length === 0) {
+                  return { syncedCount: 0, failedCount: 0 };
+              }
+
+              let syncedCount = 0;
+              let failedCount = 0;
+              const failedClears = [];
+
+              for (const clearJob of pendingClears) {
+                  try {
+                      const globalNumber = String(clearJob.table_global_number || '').replace(/\D/g, '');
+                      if (!globalNumber) {
+                          syncedCount++;
+                          continue;
+                      }
+
+                      const formData = new URLSearchParams({
+                          action: 'ruiyi_pos_cancel_table_orders',
+                          table_number: clearJob.table_display_name || `Mesa ${globalNumber}`,
+                          table_global_number: globalNumber,
+                          is_pos: 'yes',
+                          nonce: ajaxNonce
+                      });
+
+                      const response = await fetch(ajaxUrl, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                          body: formData
+                      });
+
+                      if (!response.ok) {
+                          throw new Error(`HTTP ${response.status}`);
+                      }
+
+                      const data = await response.json();
+                      if (!data.success) {
+                          throw new Error(data.data?.message || data.message || 'clear table failed');
+                      }
+
+                      const updateForm = new URLSearchParams({
+                          action: 'update_table_status',
+                          table_id: globalNumber,
+                          table_global_number: globalNumber,
+                          table_display_name: clearJob.table_display_name || `Mesa ${globalNumber}`,
+                          table_uid: clearJob.table_uid || `table:${globalNumber}`,
+                          status: 'available',
+                          is_pos: 'yes',
+                          nonce: ajaxNonce
+                      });
+                      await fetch(ajaxUrl, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                          body: updateForm
+                      });
+
+                      const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
+                      const canonicalKey = `Mesa ${globalNumber}`;
+                      if (mesasEstado[canonicalKey]) {
+                          mesasEstado[canonicalKey] = {
+                              estado: 'libre',
+                              orderId: null,
+                              orderIds: [],
+                              total: 0,
+                              cart: [],
+                              timestamp: new Date().toISOString(),
+                              table_number: clearJob.table_display_name || canonicalKey,
+                              table_global_number: globalNumber,
+                              canonical_table_key: canonicalKey,
+                              table_uid: clearJob.table_uid || `table:${globalNumber}`
+                          };
+                          localStorage.setItem('mesas_estado', JSON.stringify(mesasEstado));
+                      }
+
+                      syncedCount++;
+                      console.log('[离线清台同步] ✅ 清空桌位已同步:', clearJob);
+                  } catch (error) {
+                      failedCount++;
+                      failedClears.push(clearJob);
+                      console.error('[离线清台同步] ❌ 同步失败:', clearJob, error);
+                  }
+              }
+
+              localStorage.setItem('pending_table_clears', JSON.stringify(failedClears));
+              if (syncedCount > 0) {
+                  if (typeof fetchAndUpdateTableStatuses === 'function') {
+                      fetchAndUpdateTableStatuses();
+                  }
+                  if (typeof renderizarMesas === 'function') {
+                      setTimeout(() => renderizarMesas('after-offline-table-clear-sync'), 500);
+                  }
+              }
+
+              return { syncedCount, failedCount };
+          }
+
           // 🔥 PWA: 同步离线锁定商品删除操作到服务器
           async function syncOfflineLockedItemDeletions() {
               // 🔥🔥🔥 关键修复：检查全局同步锁，防止与 updateLockedItemsToServer 同时运行
@@ -1727,6 +1835,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           // 🔥 导出到全局，供其他脚本块调用
           window.syncOfflineLockedItemDeletions = syncOfflineLockedItemDeletions;
           window.syncOfflineTableOrders = syncOfflineTableOrders;
+          window.syncOfflineTableClears = syncOfflineTableClears;
 
           // 🔥 PWA: Force sync check when page becomes visible
           document.addEventListener('visibilitychange', () => {
@@ -3745,6 +3854,130 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
     window.showPrinterConfigDialog = showPrinterConfigDialog;
 
     /**
+     * 桌位/收银结账后清理非阻塞提示层和焦点状态。
+     * SweetAlert 的 toast/残留容器在部分平板浏览器里会继续截获键盘事件，
+     * 表现为数字键无法输入、F1/F5 快捷键失效；刷新页面后恢复。
+     */
+    function ruiyiCleanupPostCheckoutUiState(reason = '') {
+      try {
+        if (typeof Swal !== 'undefined' && typeof Swal.isVisible === 'function' && Swal.isVisible()) {
+          const popup = typeof Swal.getPopup === 'function' ? Swal.getPopup() : null;
+          if (!popup || popup.classList.contains('swal2-toast')) {
+            Swal.close();
+          }
+        }
+
+        const activeElement = document.activeElement;
+        if (activeElement && activeElement.closest && activeElement.closest('.swal2-container')) {
+          activeElement.blur();
+        }
+
+        document.querySelectorAll('.swal2-container').forEach((container) => {
+          const popup = container.querySelector('.swal2-popup');
+          const isToast = popup && popup.classList.contains('swal2-toast');
+          const hasVisibleModal = popup && !isToast && container.style.display !== 'none';
+
+          if (!popup || isToast || !hasVisibleModal) {
+            container.remove();
+          }
+        });
+
+        const hasActiveModal = document.querySelector('.swal2-container .swal2-popup:not(.swal2-toast)');
+        if (!hasActiveModal) {
+          document.body.classList.remove('swal2-shown', 'swal2-height-auto', 'swal2-no-backdrop', 'swal2-toast-shown');
+          document.documentElement.classList.remove('swal2-shown', 'swal2-height-auto');
+        }
+      } catch (error) {
+        console.warn('[结账UI清理] 失败:', reason, error);
+      }
+    }
+    window.ruiyiCleanupPostCheckoutUiState = ruiyiCleanupPostCheckoutUiState;
+
+    function ruiyiShowPostCheckoutToast(text, background = '#10b981') {
+      if (typeof ruiyiCleanupPostCheckoutUiState === 'function') {
+        ruiyiCleanupPostCheckoutUiState('before-post-checkout-toast');
+      }
+
+      if (typeof Toastify === 'function') {
+        Toastify({
+          text,
+          duration: 2000,
+          gravity: 'top',
+          position: 'right',
+          style: { background }
+        }).showToast();
+      } else {
+        console.log(text);
+      }
+
+      setTimeout(() => ruiyiCleanupPostCheckoutUiState('after-post-checkout-toast'), 100);
+      setTimeout(() => ruiyiCleanupPostCheckoutUiState('after-post-checkout-toast-late'), 800);
+    }
+    window.ruiyiShowPostCheckoutToast = ruiyiShowPostCheckoutToast;
+
+    function ruiyiRunTableCheckoutCompletionUi(paymentMethod, orderInfo = null, context = 'table_checkout') {
+      setTimeout(() => {
+        if (typeof displayVFDSuccessMessage === 'function') {
+          displayVFDSuccessMessage();
+        }
+
+        // 钱箱动作先发出，不等待弹窗渲染，减少结账完成后的体感等待。
+        if (typeof ruiyiOpenDrawerAfterPayment === 'function') {
+          ruiyiOpenDrawerAfterPayment(paymentMethod, context);
+        }
+
+        if (orderInfo && typeof saveAndShowLastOrderInfo === 'function') {
+          saveAndShowLastOrderInfo(orderInfo);
+        } else if (typeof ruiyiShowPostCheckoutToast === 'function') {
+          ruiyiShowPostCheckoutToast('<?php echo ruiyi_translate('Pago completado', 'Payment completed', '支付完成'); ?>');
+        }
+      }, 60);
+    }
+    window.ruiyiRunTableCheckoutCompletionUi = ruiyiRunTableCheckoutCompletionUi;
+
+    /**
+     * 结账成功后的钱箱动作：独立于小票打印链路。
+     * 小票生成/打印失败不能阻止开钱箱，也不能弹配置窗口阻塞结账完成流程。
+     */
+    async function ruiyiOpenDrawerAfterPayment(paymentMethod, context = 'payment') {
+      const method = String(paymentMethod || '').toLowerCase();
+      const openDrawerOnCard = window.clodopConfig?.openDrawerOnCard || false;
+      const shouldOpenDrawer = method === 'cash' || method === 'mixed' || (method === 'card' && openDrawerOnCard);
+
+      if (!shouldOpenDrawer) {
+        return false;
+      }
+
+      try {
+        if (typeof abrirCajonDinero === 'function') {
+          return await abrirCajonDinero();
+        }
+
+        if (typeof clodopOpenCashDrawer === 'function') {
+          return clodopOpenCashDrawer();
+        }
+      } catch (error) {
+        console.warn('[钱箱] 使用当前配置开钱箱失败，尝试刷新配置后重试:', context, error);
+        try {
+          if (typeof window.refreshClodopRuntimeConfig === 'function') {
+            await window.refreshClodopRuntimeConfig('drawer_retry:' + context);
+          }
+          if (typeof abrirCajonDinero === 'function') {
+            return await abrirCajonDinero();
+          }
+          if (typeof clodopOpenCashDrawer === 'function') {
+            return clodopOpenCashDrawer();
+          }
+        } catch (retryError) {
+          console.warn('[钱箱] 结账后自动开钱箱失败（不阻塞结账）:', context, retryError);
+        }
+      }
+
+      return false;
+    }
+    window.ruiyiOpenDrawerAfterPayment = ruiyiOpenDrawerAfterPayment;
+
+    /**
      * 🔥 用户友好的通用错误提示对话框
      * 显示友好的错误信息和刷新按钮
      */
@@ -3910,6 +4143,78 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
     }
     window.ruiyiSafeResolveGlobalTableNumber = ruiyiSafeResolveGlobalTableNumber;
 
+    function ruiyiResolveTableDisplayName(tableNumber, fallback = '') {
+        const raw = String(tableNumber ?? '').trim();
+        const fallbackText = String(fallback ?? '').trim();
+        const mappingsRaw = window.tableCategoryMappings || {};
+        const mappings = Array.isArray(mappingsRaw) ? mappingsRaw : Object.values(mappingsRaw || {});
+        const normalize = value => String(value ?? '').replace(/\s+/g, '').toUpperCase();
+        const rawNorm = normalize(raw);
+        const globalNumber = raw
+            ? (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+                ? String(ruiyiSafeResolveGlobalTableNumber(raw) || '')
+                : '')
+            : '';
+
+        const mapping = mappings.find(m => {
+            if (!m) return false;
+            const global = String(m.global_table_number ?? '').trim();
+            const candidates = [
+                m.category_display_name,
+                m.display_name,
+                m.table_number,
+                m.category_name && m.local_table_number !== undefined ? `${m.category_name}${m.local_table_number}` : '',
+                m.category_name && m.local_table_number !== undefined ? `${m.category_name} ${m.local_table_number}` : ''
+            ].filter(Boolean);
+            return (globalNumber && global === globalNumber) ||
+                (rawNorm && candidates.some(candidate => normalize(candidate) === rawNorm));
+        });
+
+        if (mapping) {
+            return String(mapping.category_display_name || mapping.display_name || mapping.table_number || raw || fallbackText).trim();
+        }
+
+        if (raw && !/^(?:Mesa|餐桌|Table)\s*\d+$/i.test(raw) && !/^\d+$/.test(raw)) {
+            return raw;
+        }
+
+        return fallbackText || raw || (globalNumber ? `Mesa ${globalNumber}` : '');
+    }
+    window.ruiyiResolveTableDisplayName = ruiyiResolveTableDisplayName;
+
+    function ruiyiResetSwalLoadingState(reason = '') {
+        try {
+            if (typeof Swal !== 'undefined' && typeof Swal.hideLoading === 'function') {
+                Swal.hideLoading();
+            }
+            const popup = typeof Swal !== 'undefined' && typeof Swal.getPopup === 'function'
+                ? Swal.getPopup()
+                : document.querySelector('.swal2-popup');
+            if (popup) {
+                popup.classList.remove('swal2-loading');
+                popup.removeAttribute('data-loading');
+                popup.setAttribute('aria-busy', 'false');
+            }
+            const actions = document.querySelector('.swal2-actions');
+            if (actions) {
+                actions.classList.remove('swal2-loading');
+            }
+            const loader = document.querySelector('.swal2-loader');
+            if (loader) {
+                loader.style.display = 'none';
+            }
+            const confirmButton = typeof Swal !== 'undefined' && typeof Swal.getConfirmButton === 'function'
+                ? Swal.getConfirmButton()
+                : document.querySelector('.swal2-confirm');
+            if (confirmButton) {
+                confirmButton.style.display = '';
+            }
+        } catch (error) {
+            console.warn('[Swal] 无法重置 loading 状态:', reason, error);
+        }
+    }
+    window.ruiyiResetSwalLoadingState = ruiyiResetSwalLoadingState;
+
     function ruiyiGetTerrazaDebugInfo(tableNumber) {
         const raw = String(tableNumber ?? '').trim();
         const resolved = raw
@@ -3988,6 +4293,11 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
      */
     function savePosCartToStorage() {
         try {
+            if (window._suppressPosCartStorageUntil && Date.now() < window._suppressPosCartStorageUntil) {
+                localStorage.removeItem(POS_CART_STORAGE_KEY);
+                return;
+            }
+
             // 🔥🔥🔥 关键修复：在恢复完成前不保存，防止空购物车覆盖已保存的数据
             if (!_posCartRestoreComplete) {
                 return;
@@ -4030,6 +4340,11 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
      */
     function loadPosCartFromStorage() {
         try {
+            if (window._suppressPosCartStorageUntil && Date.now() < window._suppressPosCartStorageUntil) {
+                localStorage.removeItem(POS_CART_STORAGE_KEY);
+                return false;
+            }
+
             // 🔥🔥🔥 改进判断：使用订单类型和桌位号来准确判断是否应该加载
             const tableNumber = document.getElementById('table-number')?.value.trim();
             const currentOrderType = sessionStorage.getItem('tipoPedidoSeleccionado');
@@ -4088,6 +4403,122 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         }
     }
     window.clearPosCartStorage = clearPosCartStorage;
+
+    function ruiyiSuppressPosCartStorage(ms = 5000, reason = '') {
+        window._suppressPosCartStorageUntil = Date.now() + ms;
+        if (typeof clearPosCartStorage === 'function') {
+            clearPosCartStorage();
+        }
+        console.log('[快速结账缓存] 临时禁止恢复/保存:', reason, ms + 'ms');
+    }
+    window.ruiyiSuppressPosCartStorage = ruiyiSuppressPosCartStorage;
+
+    function ruiyiClearCashierCartAfterTableCheckout(tableNumber = '', reason = 'table_checkout') {
+        try {
+            if (typeof ruiyiSuppressPosCartStorage === 'function') {
+                ruiyiSuppressPosCartStorage(7000, reason);
+            }
+
+            window._currentViewingTable = null;
+            window.cartModified = false;
+            window._forceEmptyCashierOnNextCajero = true;
+
+            if (typeof cart !== 'undefined') {
+                cart = [];
+            }
+            window.cart = [];
+
+            if (typeof ruiyiSetCartTableIdentity === 'function') {
+                ruiyiSetCartTableIdentity('', reason);
+            }
+
+            sessionStorage.removeItem('tableViewMode');
+            sessionStorage.removeItem('tableOrderData');
+            sessionStorage.removeItem('isViewMode');
+            sessionStorage.removeItem('tableViewOrderData');
+
+            const tableNumberInput = document.getElementById('table-number');
+            if (tableNumberInput) {
+                tableNumberInput.value = '';
+            }
+            if (typeof updateCurrentTableDisplay === 'function') {
+                updateCurrentTableDisplay('');
+            }
+
+            const orderTitle = document.getElementById('cart-order-title');
+            if (orderTitle) {
+                orderTitle.innerHTML = '';
+            }
+
+            ['checkout-table-btn', 'toolbox-toggle-btn', 'split-checkout-btn'].forEach(btnId => {
+                const btn = document.getElementById(btnId);
+                if (btn) {
+                    btn.classList.add('hidden');
+                    delete btn.dataset.tableNumber;
+                }
+            });
+
+            const cartActionsContainer = document.querySelector('.cart-actions-fixed');
+            if (cartActionsContainer && window.Alpine) {
+                const alpineData = Alpine.$data(cartActionsContainer);
+                if (alpineData) {
+                    alpineData.toolboxOpen = false;
+                }
+            }
+
+            if (typeof renderCart === 'function') {
+                renderCart();
+            }
+        } catch (error) {
+            console.warn('[桌位结账清理购物车] 失败:', tableNumber, reason, error);
+        }
+    }
+    window.ruiyiClearCashierCartAfterTableCheckout = ruiyiClearCashierCartAfterTableCheckout;
+
+    function ruiyiClearTableContextForTakeawayCheckout(reason = 'takeaway_checkout') {
+        try {
+            window._currentViewingTable = null;
+            window.cartModified = false;
+
+            sessionStorage.removeItem('tableViewMode');
+            sessionStorage.removeItem('isViewMode');
+            sessionStorage.removeItem('tableOrderData');
+            sessionStorage.removeItem('tableViewOrderData');
+            sessionStorage.removeItem('fromTableModule');
+            sessionStorage.removeItem('offlineTableCart');
+            sessionStorage.setItem('tipoPedidoSeleccionado', 'llevar');
+
+            const tableNumberInput = document.getElementById('table-number');
+            if (tableNumberInput) {
+                tableNumberInput.value = '';
+            }
+            if (typeof updateCurrentTableDisplay === 'function') {
+                updateCurrentTableDisplay('');
+            }
+
+            ['checkout-table-btn', 'save-table-order-btn', 'toolbox-toggle-btn', 'split-checkout-btn', 'switch-table-btn'].forEach(btnId => {
+                const btn = document.getElementById(btnId);
+                if (!btn) return;
+                if (btnId !== 'checkout-table-btn') {
+                    btn.classList.add('hidden');
+                }
+                delete btn.dataset.tableNumber;
+            });
+
+            const cartActionsContainer = document.querySelector('.cart-actions-fixed');
+            if (cartActionsContainer && window.Alpine) {
+                const alpineData = Alpine.$data(cartActionsContainer);
+                if (alpineData) {
+                    alpineData.toolboxOpen = false;
+                }
+            }
+
+            console.log('[快速结账] 已清除桌位上下文:', reason);
+        } catch (error) {
+            console.warn('[快速结账] 清除桌位上下文失败:', reason, error);
+        }
+    }
+    window.ruiyiClearTableContextForTakeawayCheckout = ruiyiClearTableContextForTakeawayCheckout;
 
     // 🔥🔥🔥 页面加载时恢复收银购物车（非桌位模式）
     document.addEventListener('DOMContentLoaded', function() {
@@ -4157,30 +4588,81 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       if (!panel || !listEl || !emptyEl || !countEl) return;
 
       let pendingPayments = [];
+      let pendingOrders = [];
 
-      // 🔥 获取待同步支付（已结账但需要服务器确认的支付）- 只显示 PaymentQueue 中的条目
+      // 🔥 获取待同步订单和待同步支付。同步器会同时处理 pending_orders 与 pending_payments，
+      // 历史模块也必须合并显示，否则会出现实际已排队多单，但界面只显示 1 单的问题。
       try {
         if (typeof OfflineManager !== 'undefined' && OfflineManager.ensureDB) {
           const db = await OfflineManager.ensureDB();
+          const readStore = (storeName) => new Promise((resolve, reject) => {
+            if (!db || !db.objectStoreNames.contains(storeName)) {
+              resolve([]);
+              return;
+            }
+            const tx = db.transaction([storeName], 'readonly');
+            const store = tx.objectStore(storeName);
+            const getReq = store.getAll();
+            getReq.onsuccess = () => resolve(getReq.result || []);
+            getReq.onerror = () => reject(getReq.error);
+          });
+
           if (db && db.objectStoreNames.contains('pending_payments')) {
-            const tx = db.transaction(['pending_payments'], 'readonly');
-            const store = tx.objectStore('pending_payments');
-            pendingPayments = await new Promise((resolve, reject) => {
-              const getReq = store.getAll();
-              getReq.onsuccess = () => resolve(getReq.result || []);
-              getReq.onerror = () => reject(getReq.error);
-            });
+            pendingPayments = await readStore('pending_payments');
             // 只显示 pending 和 failed 状态的支付
             pendingPayments = pendingPayments.filter(p => p.status === 'pending' || p.status === 'failed');
           }
+
+          if (db && db.objectStoreNames.contains('pending_orders')) {
+            pendingOrders = await readStore('pending_orders');
+            // pending_orders 包含桌位挂单、桌位离线结账、fallback 快速结账等
+            pendingOrders = pendingOrders.filter(order => {
+              const status = order.status || 'pending';
+              return status === 'pending' || status === 'failed';
+            });
+          }
         }
       } catch (e) {
-        console.warn('[Historial] Failed to read pending payments:', e);
+        console.warn('[Historial] Failed to read pending offline queues:', e);
         pendingPayments = [];
+        pendingOrders = [];
       }
 
-      // 🔥 只统计 PaymentQueue 待同步数据
-      const totalPending = pendingPayments.length;
+      const pendingRows = [];
+
+      pendingPayments.forEach((payment) => {
+        const cartItems = payment.cartSnapshot || payment.cart || [];
+        const finalTotal = parseFloat(payment.orderTotalAmount || payment.totalAmount || 0);
+        pendingRows.push({
+          id: payment.id,
+          source: 'payment',
+          timestamp: payment.timestamp || 0,
+          cartItems,
+          total: finalTotal,
+          paymentMethod: payment.paymentMethod || '',
+          status: payment.status || 'pending',
+          paid: true
+        });
+      });
+
+      pendingOrders.forEach((order) => {
+        const cartItems = order.cartSnapshot || order.cart || [];
+        const finalTotal = parseFloat(order.orderTotalAmount || order.totalAmount || order.total_amount || order.total || 0);
+        const paymentMethod = order.payment_method || order.paymentMethod || '';
+        const isPaid = order.is_payment_completion === true || (paymentMethod && paymentMethod !== 'pending');
+        pendingRows.push({
+          id: order.id,
+          source: 'order',
+          timestamp: order.timestamp || 0,
+          cartItems,
+          total: finalTotal,
+          paymentMethod,
+          status: order.status || 'pending',
+          paid: isPaid
+        });
+      });
+
+      const totalPending = pendingRows.length;
 
       // Show panel if offline OR there are pending items
       const isOnline = navigator.onLine && window.RUIYI_POS?.isOnline !== false;
@@ -4201,36 +4683,36 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
       emptyEl.classList.add('hidden');
 
-      // 🔥 显示待同步支付（PaymentQueue中的已结账订单）
-      pendingPayments.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-      pendingPayments.slice(0, 25).forEach((payment) => {
-        const cartItems = payment.cartSnapshot || payment.cart || [];
+      // 🔥 显示待同步项目：pending_payments + pending_orders
+      pendingRows.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      pendingRows.slice(0, 25).forEach((pendingItem) => {
+        const cartItems = pendingItem.cartItems || [];
         const itemsCount = Array.isArray(cartItems) ? cartItems.reduce((sum, it) => sum + (parseFloat(it.quantity) || 0), 0) : 0;
 
-        // 🔥 修复：orderTotalAmount 是实际应付金额（已扣除折扣、餐券、公司票等）
-        // 不需要再减任何抵扣，直接使用 orderTotalAmount 或 totalAmount
-        // totalAmount 字段也是已扣除所有抵扣后的实际支付金额
-        const finalTotal = parseFloat(payment.orderTotalAmount || payment.totalAmount || 0);
+        const finalTotal = parseFloat(pendingItem.total || 0);
         const totalText = `€${finalTotal.toFixed(2)}`;
 
-        const paymentMethod = payment.paymentMethod || '';
-        const statusBadge = payment.status === 'failed'
+        const paymentMethod = pendingItem.paymentMethod || '';
+        const statusBadge = pendingItem.status === 'failed'
           ? '<span class="ml-1 px-1.5 py-0.5 text-xs rounded bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-200"><?php echo ruiyi_translate('Error', 'Error', '失败'); ?></span>'
           : '';
+        const rowMessage = pendingItem.paid
+          ? '<?php echo ruiyi_translate('Pagado - pendiente sincronizar', 'Paid - pending sync', '已结账 - 等待同步'); ?>'
+          : '<?php echo ruiyi_translate('Guardado - pendiente sincronizar', 'Saved - pending sync', '已保存 - 等待同步'); ?>';
 
         const row = document.createElement('div');
         row.className = 'bg-green-50/70 dark:bg-green-900/30 border border-green-200 dark:border-green-800 rounded-md p-3 flex items-start justify-between gap-3';
-        // 🔥 修复：移除订单类型标签（外卖/桌位），只显示时间、数量、支付方式
+        // 🔥 只显示时间、数量、支付方式
         row.innerHTML = `
           <div class="min-w-0">
             <div class="flex items-center gap-2 flex-wrap">
-              <span class="text-xs text-gray-600 dark:text-gray-300">${formatOfflineOrderTime(payment.timestamp)}</span>
+              <span class="text-xs text-gray-600 dark:text-gray-300">${formatOfflineOrderTime(pendingItem.timestamp)}</span>
               <span class="text-xs text-gray-600 dark:text-gray-300">• ${itemsCount} <?php echo ruiyi_translate('artículos', 'items', '件'); ?></span>
               ${paymentMethod ? `<span class="text-xs text-gray-600 dark:text-gray-300">• ${paymentMethod}</span>` : ''}
               ${statusBadge}
             </div>
             <div class="mt-1 text-sm text-green-800 dark:text-green-100">
-              <i class="fas fa-check-circle mr-1"></i><?php echo ruiyi_translate('Pagado - pendiente sincronizar', 'Paid - pending sync', '已结账 - 等待同步'); ?>
+              <i class="fas fa-check-circle mr-1"></i>${rowMessage}
             </div>
           </div>
           <div class="text-right flex-shrink-0">
@@ -5369,6 +5851,48 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         }
       });
     }
+
+    function ruiyiGetActiveTableForToolbox(fallbackTableNumber = '') {
+      if (typeof ruiyiResolveActiveTableNumber === 'function') {
+        const resolved = ruiyiResolveActiveTableNumber(fallbackTableNumber, { preferFallback: !!fallbackTableNumber });
+        if (resolved) return resolved;
+      }
+
+      const tableInputValue = document.getElementById('table-number')?.value.trim();
+      if (tableInputValue) return tableInputValue;
+
+      try {
+        const viewModeData = JSON.parse(sessionStorage.getItem('tableViewMode') || '{}');
+        if (viewModeData && viewModeData.table) return viewModeData.table;
+      } catch (error) {
+        console.warn('[工具箱按钮恢复] 读取桌位状态失败:', error);
+      }
+
+      return fallbackTableNumber || '';
+    }
+
+    function ruiyiEnsureTableToolboxActionsVisible(fallbackTableNumber = '', reason = '') {
+      const activeTableNumber = ruiyiGetActiveTableForToolbox(fallbackTableNumber);
+      if (!activeTableNumber) return false;
+
+      const toolboxToggleBtn = document.getElementById('toolbox-toggle-btn');
+      const splitCheckoutBtn = document.getElementById('split-checkout-btn');
+      const switchTableBtn = document.getElementById('switch-table-btn');
+
+      if (toolboxToggleBtn) {
+        toolboxToggleBtn.classList.remove('hidden');
+      }
+
+      [splitCheckoutBtn, switchTableBtn].forEach(btn => {
+        if (!btn) return;
+        btn.classList.remove('hidden');
+        btn.style.display = 'flex';
+        btn.dataset.tableNumber = activeTableNumber;
+      });
+
+      return true;
+    }
+    window.ruiyiEnsureTableToolboxActionsVisible = ruiyiEnsureTableToolboxActionsVisible;
     
     // 统一的按钮状态管理函数
     function updateAllButtonStates() {
@@ -5497,6 +6021,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           if (switchTableBtn) {
             switchTableBtn.dataset.tableNumber = isViewMode.table;
           }
+          if (typeof ruiyiEnsureTableToolboxActionsVisible === 'function') {
+            ruiyiEnsureTableToolboxActionsVisible(isViewMode.table, 'updateAllButtonStates:view-locked');
+          }
 
           // 🔥 查看模式：隐藏打印最后小票按钮（打印桌位订单按钮已移除）
           if (reprintLastReceiptBtn) {
@@ -5522,6 +6049,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           }
 
           // 🔥 工具箱按钮的显示由 updateProformaButtonVisibility() 控制（桌位模式下始终显示）
+          if (typeof ruiyiEnsureTableToolboxActionsVisible === 'function') {
+            ruiyiEnsureTableToolboxActionsVisible(isViewMode.table, 'updateAllButtonStates:view-unlocked');
+          }
 
           if (secondRow) {
             secondRow.className = ''; // 恢复全宽
@@ -5760,8 +6290,144 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       }
     }
 
+    async function fetchAuthoritativeTableStatusesForSwitch() {
+      if (!navigator.onLine) {
+        return { fetched: false, occupiedMap: new Map() };
+      }
+
+      try {
+        const data = new URLSearchParams();
+        data.append('action', 'get_tables_status');
+        data.append('nonce', posNonce);
+        data.append('force_refresh', '1');
+
+        const response = await fetch(posAjaxUrl, {
+          method: 'POST',
+          body: data
+        });
+
+        if (!response.ok) {
+          throw new Error('Table status refresh failed: ' + response.statusText);
+        }
+
+        const result = await response.json();
+        const occupiedMap = new Map();
+
+        if (result.success && result.data && Array.isArray(result.data.tables_updates)) {
+          result.data.tables_updates.forEach(update => {
+            const rawNumber = String(update.number || '');
+            const numericOnly = /^\d+$/.test(rawNumber) ? rawNumber : resolveGlobalTableNumber(rawNumber);
+            if (!numericOnly) {
+              return;
+            }
+
+            const status = update.status === 'occupied' ? 'ocupada' : update.status;
+            if ((status === 'ocupada' || status === 'liquidando') && update.orderId) {
+              occupiedMap.set(String(numericOnly), {
+                total: parseFloat(update.total || 0) || 0,
+                orderId: update.orderId,
+                status
+              });
+            }
+          });
+        }
+
+        return { fetched: true, occupiedMap };
+      } catch (error) {
+        console.warn('[换台] 无法刷新服务器桌位状态，使用本地缓存兜底:', error.message);
+        return { fetched: false, occupiedMap: new Map() };
+      }
+    }
+
+    function hasStoredCartItems(storedValue) {
+      if (!storedValue) {
+        return false;
+      }
+      if (Array.isArray(storedValue)) {
+        return storedValue.length > 0;
+      }
+      if (storedValue.cart && Array.isArray(storedValue.cart) && storedValue.cart.length > 0) {
+        return true;
+      }
+      if (storedValue._offlineNewItems && Array.isArray(storedValue._offlineNewItems) && storedValue._offlineNewItems.length > 0) {
+        return true;
+      }
+      if (typeof storedValue === 'object' && !storedValue.estado && !storedValue.status && !storedValue.orderId) {
+        return Object.keys(storedValue).length > 0;
+      }
+      return false;
+    }
+
+    function buildSwitchTableKeys(rawTable, globalNumber, displayName = '') {
+      const currentPrefix = (window.RUIYI_TRANS && window.RUIYI_TRANS.table) ? window.RUIYI_TRANS.table : 'Mesa';
+      const raw = String(rawTable || '').trim();
+      const global = String(globalNumber || (raw && typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(raw) : '') || '').trim();
+      const display = String(displayName || '').trim();
+      const keys = [
+        raw,
+        display,
+        display ? display.toUpperCase() : '',
+        global,
+        global ? `Mesa ${global}` : '',
+        global ? `Mesa${global}` : '',
+        global ? `MESA ${global}` : '',
+        global ? `Table ${global}` : '',
+        global ? `Table${global}` : '',
+        global ? `餐桌 ${global}` : '',
+        global ? `餐桌${global}` : '',
+        global ? `${currentPrefix} ${global}` : '',
+        global ? `${currentPrefix}${global}` : ''
+      ];
+
+      const mappingsRaw = window.tableCategoryMappings || {};
+      const mappings = Array.isArray(mappingsRaw) ? mappingsRaw : Object.values(mappingsRaw || {});
+      const mapping = global ? mappings.find(m => String(m && m.global_table_number) === global) : null;
+      if (mapping) {
+        const categoryName = String(mapping.category_name || '').trim();
+        const localNumber = String(mapping.local_table_number || '').trim();
+        keys.push(mapping.category_display_name || '');
+        keys.push(mapping.display_name || '');
+        if (categoryName && localNumber) {
+          keys.push(`${categoryName} ${localNumber}`);
+          keys.push(`${categoryName}${localNumber}`);
+          keys.push(`${categoryName.toUpperCase()} ${localNumber}`);
+          keys.push(`${categoryName.toUpperCase()}${localNumber}`);
+        }
+      }
+
+      return Array.from(new Set(keys.map(key => String(key || '').trim()).filter(Boolean)));
+    }
+
+    function hasUnsyncedStoredCartItems(storedValue) {
+      if (!hasStoredCartItems(storedValue)) {
+        return false;
+      }
+
+      const rawItems = Array.isArray(storedValue)
+        ? storedValue
+        : (storedValue && Array.isArray(storedValue.cart)
+          ? storedValue.cart
+          : (storedValue && typeof storedValue === 'object' ? Object.values(storedValue) : []));
+
+      return rawItems.some(item => {
+        if (!item || typeof item !== 'object') {
+          return true;
+        }
+        if (Array.isArray(item)) {
+          return item.length > 0;
+        }
+        const quantity = parseFloat(item.quantity ?? item.qty ?? 1) || 0;
+        if (quantity <= 0) {
+          return false;
+        }
+        return !item.locked && !item.orderId && !item.order_id && !item.itemId && !item.item_id;
+      });
+    }
+
     // 显示换台选择模态窗
-    function showTableSwitchModal(fromTable) {
+    async function showTableSwitchModal(fromTable) {
+      const authoritativeStatuses = await fetchAuthoritativeTableStatusesForSwitch();
+
       // 获取所有餐桌状态
       const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
       const carritosGuardados = JSON.parse(localStorage.getItem('carritos_mesas') || '{}');
@@ -5783,33 +6449,44 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       }
 
       // 🔥 辅助函数：检查桌位状态
-      function getTableStatus(mesaId, globalNumber) {
+      function getTableStatus(mesaId, globalNumber, displayName = '') {
         // 检查多种可能的 key 格式
-        const possibleKeys = [
-          mesaId,
-          `Mesa ${globalNumber}`,
-          `餐桌 ${globalNumber}`,
-          globalNumber.toString()
-        ];
+        const possibleKeys = buildSwitchTableKeys(mesaId, globalNumber, displayName);
 
         let isOccupied = false;
         let tableTotal = 0;
+        let hasLocalCart = false;
+        let hasLocalActiveOrder = false;
 
         for (const key of possibleKeys) {
           // 检查购物车
-          if (carritosGuardados[key] && (Array.isArray(carritosGuardados[key]) ? carritosGuardados[key].length > 0 : Object.keys(carritosGuardados[key]).length > 0)) {
-            isOccupied = true;
+          if (hasStoredCartItems(carritosGuardados[key])) {
+            hasLocalCart = true;
           }
           // 检查状态
           const estado = mesasEstado[key];
-          if (estado && estado.estado && estado.estado !== 'libre') {
-            isOccupied = true;
+          if (estado && estado.estado && estado.estado !== 'libre' && (estado.orderId || hasStoredCartItems(estado))) {
+            hasLocalActiveOrder = true;
             if (estado.total) {
               tableTotal = parseFloat(estado.total) || 0;
             }
           }
         }
 
+        if (authoritativeStatuses.fetched) {
+          const serverStatus = authoritativeStatuses.occupiedMap.get(String(globalNumber));
+          if (serverStatus) {
+            return { isOccupied: true, tableTotal: serverStatus.total };
+          }
+
+          // 服务器确认没有活跃订单时，只保留本机真实未同步购物车；忽略旧状态缓存。
+          return {
+            isOccupied: possibleKeys.some(key => hasUnsyncedStoredCartItems(carritosGuardados[key])),
+            tableTotal
+          };
+        }
+
+        isOccupied = hasLocalCart || hasLocalActiveOrder;
         return { isOccupied, tableTotal };
       }
 
@@ -5826,7 +6503,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             return;
           }
 
-          const { isOccupied, tableTotal } = getTableStatus(mesaId, globalNumber);
+          const { isOccupied, tableTotal } = getTableStatus(mesaId, globalNumber, categoryDisplayName);
 
           allTables.push({
             id: globalNumber,
@@ -5974,7 +6651,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
     // 执行换台操作
     // 🔥 mergeMode=true 时为合并拼桌模式（目标桌位已占用时合并而非报错）
-    function executeTableSwitch(fromTable, toTable, mergeMode = false) {
+    async function executeTableSwitch(fromTable, toTable, mergeMode = false) {
       // 🔥 获取正确的显示名称
       const allMappings = Object.values(tableCategoryMappings);
       const fromTableNum = resolveGlobalTableNumber(fromTable);
@@ -6012,6 +6689,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         // 1. 验证源桌位和目标桌位状态
         const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
         const carritosGuardados = JSON.parse(localStorage.getItem('carritos_mesas') || '{}');
+        const authoritativeStatusesForExecution = mergeMode
+          ? { fetched: false, occupiedMap: new Map() }
+          : await fetchAuthoritativeTableStatusesForSwitch();
 
         // 🔥🔥🔥 【2026-01-30 修复】验证源桌位是否占用 - 包含显示名称格式
         const possibleFromKeys = [
@@ -6091,33 +6771,64 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         // 使用实际找到的 key
         const effectiveFromKey = actualFromKey || fromTable;
 
-        // 🔥 修复：验证目标桌位是否空闲 - 同样使用多种 key 格式
+        // 🔥 修复：验证目标桌位是否空闲 - 与换台弹窗使用同一套规范化 key
         const toTableNum = resolveGlobalTableNumber(toTable);
-        const possibleToKeys = [
-          toTable,
-          `Mesa ${toTable}`,
-          `餐桌 ${toTable}`,
-          `Mesa ${toTableNum}`,
-          `餐桌 ${toTableNum}`,
-          toTableNum
-        ].filter(k => k);
+        const canonicalToKey = `Mesa ${toTableNum}`;
+        const possibleToKeys = buildSwitchTableKeys(toTable, toTableNum, toTableDisplayName);
 
         let targetOccupied = false;
         let actualToKey = toTable;
 
-        for (const key of possibleToKeys) {
-          const targetMesaState = mesasEstado[key];
-          const targetCarrito = carritosGuardados[key];
-          if (targetCarrito && (Array.isArray(targetCarrito) ? targetCarrito.length > 0 : Object.keys(targetCarrito).length > 0)) {
+        if (!mergeMode && authoritativeStatusesForExecution.fetched) {
+          const serverStatus = authoritativeStatusesForExecution.occupiedMap.get(String(toTableNum));
+          if (serverStatus) {
             targetOccupied = true;
-            break;
+          } else {
+            const hasLocalUnsyncedCart = possibleToKeys.some(key => hasUnsyncedStoredCartItems(carritosGuardados[key]));
+
+            if (hasLocalUnsyncedCart) {
+              targetOccupied = true;
+            } else {
+              const clearedStaleKeys = [];
+              for (const key of possibleToKeys) {
+                const targetMesaState = mesasEstado[key];
+                const targetCarrito = carritosGuardados[key];
+                if (targetMesaState || targetCarrito) {
+                  actualToKey = key;
+                }
+                if (targetMesaState && targetMesaState.estado !== 'libre') {
+                  delete mesasEstado[key];
+                  clearedStaleKeys.push(key);
+                }
+                if (targetCarrito && !hasStoredCartItems(targetCarrito)) {
+                  delete carritosGuardados[key];
+                }
+              }
+              if (clearedStaleKeys.length > 0) {
+                console.warn('[换台] 服务器确认目标桌位空闲，已清理本地旧占用缓存:', {
+                  toTable,
+                  toTableDisplayName,
+                  toTableNum,
+                  clearedStaleKeys
+                });
+              }
+            }
           }
-          if (targetMesaState && targetMesaState.estado !== 'libre') {
-            targetOccupied = true;
-            break;
-          }
-          if (targetMesaState || targetCarrito) {
-            actualToKey = key;
+        } else {
+          for (const key of possibleToKeys) {
+            const targetMesaState = mesasEstado[key];
+            const targetCarrito = carritosGuardados[key];
+            if (targetCarrito && hasStoredCartItems(targetCarrito)) {
+              targetOccupied = true;
+              break;
+            }
+            if (targetMesaState && targetMesaState.estado !== 'libre') {
+              targetOccupied = true;
+              break;
+            }
+            if (targetMesaState || targetCarrito) {
+              actualToKey = key;
+            }
           }
         }
 
@@ -6129,14 +6840,14 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         // 🔥 快照（用于合并模式下的回滚）
         const backupSourceState = mesasEstado[effectiveFromKey] ? JSON.parse(JSON.stringify(mesasEstado[effectiveFromKey])) : null;
         const backupSourceCart = carritosGuardados[effectiveFromKey] ? JSON.parse(JSON.stringify(carritosGuardados[effectiveFromKey])) : null;
-        const backupTargetState = mesasEstado[toTable] ? JSON.parse(JSON.stringify(mesasEstado[toTable])) : null;
-        const backupTargetCart = carritosGuardados[toTable] ? JSON.parse(JSON.stringify(carritosGuardados[toTable])) : null;
+	        const backupTargetState = mesasEstado[canonicalToKey] ? JSON.parse(JSON.stringify(mesasEstado[canonicalToKey])) : null;
+	        const backupTargetCart = carritosGuardados[canonicalToKey] ? JSON.parse(JSON.stringify(carritosGuardados[canonicalToKey])) : null;
 
         // 2. 数据迁移
         if (mergeMode) {
           // 🔥 合并模式：将源桌位购物车合并到目标桌位
           const sourceCart = carritosGuardados[effectiveFromKey];
-          const targetCart = carritosGuardados[toTable];
+	          const targetCart = carritosGuardados[canonicalToKey];
 
           // 统一转换为数组并拼接
           const toArray = (c) => {
@@ -6146,40 +6857,40 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           };
           const mergedCart = [...toArray(targetCart), ...toArray(sourceCart)];
 
-          if (mergedCart.length > 0) {
-            carritosGuardados[toTable] = mergedCart;
-          }
-          delete carritosGuardados[effectiveFromKey];
+	          if (mergedCart.length > 0) {
+	            carritosGuardados[canonicalToKey] = mergedCart;
+	          }
+	          delete carritosGuardados[effectiveFromKey];
 
-          // 目标桌位状态保持占用；删除源桌位状态
-          if (!mesasEstado[toTable]) {
-            mesasEstado[toTable] = { estado: 'ocupada' };
-          } else {
-            mesasEstado[toTable].estado = 'ocupada';
-          }
-          delete mesasEstado[effectiveFromKey];
-        } else {
-          // 原换台逻辑 - 🔥 换台后目标桌位统一设为 'ocupada'
-          if (mesasEstado[effectiveFromKey]) {
-            mesasEstado[toTable] = { ...mesasEstado[effectiveFromKey], estado: 'ocupada' };
-            delete mesasEstado[effectiveFromKey];
-          } else if (sourceTableData) {
-            mesasEstado[toTable] = { ...sourceTableData, estado: 'ocupada' };
-          }
+	          // 目标桌位状态保持占用；删除源桌位状态
+	          if (!mesasEstado[canonicalToKey]) {
+	            mesasEstado[canonicalToKey] = { estado: 'ocupada' };
+	          } else {
+	            mesasEstado[canonicalToKey].estado = 'ocupada';
+	          }
+	          delete mesasEstado[effectiveFromKey];
+	        } else {
+	          // 原换台逻辑 - 🔥 换台后目标桌位统一设为 'ocupada'
+	          if (mesasEstado[effectiveFromKey]) {
+	            mesasEstado[canonicalToKey] = { ...mesasEstado[effectiveFromKey], estado: 'ocupada' };
+	            delete mesasEstado[effectiveFromKey];
+	          } else if (sourceTableData) {
+	            mesasEstado[canonicalToKey] = { ...sourceTableData, estado: 'ocupada' };
+	          }
 
-          // 迁移购物车数据
-          if (carritosGuardados[effectiveFromKey]) {
-            carritosGuardados[toTable] = { ...carritosGuardados[effectiveFromKey] };
-            delete carritosGuardados[effectiveFromKey];
-          }
-        }
+	          // 迁移购物车数据
+	          if (carritosGuardados[effectiveFromKey]) {
+	            carritosGuardados[canonicalToKey] = { ...carritosGuardados[effectiveFromKey] };
+	            delete carritosGuardados[effectiveFromKey];
+	          }
+	        }
 
         // 清理可能的其他 key 格式
         for (const key of possibleFromKeys) {
-          if (key !== toTable) {
-            delete mesasEstado[key];
-            delete carritosGuardados[key];
-          }
+	          if (key !== canonicalToKey) {
+	            delete mesasEstado[key];
+	            delete carritosGuardados[key];
+	          }
         }
 
         // 保存到localStorage
@@ -6190,9 +6901,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         const fromTableNumber = resolveGlobalTableNumber(fromTable);
         const toTableNumber = resolveGlobalTableNumber(toTable);
 
-        // 🔥 获取完整桌位名称（如 COMEDOR1, DOMICILIO3）用于精确匹配
-        const fromTableFull = fromTableDisplayName.toUpperCase().replace(/\s+/g, '');
-        const toTableFull = toTableDisplayName.toUpperCase().replace(/\s+/g, '');
+        // 传递原始显示名用于 UI/meta；后端会单独规范化匹配。
+        const fromTableFull = String(fromTableDisplayName || fromTable).trim();
+        const toTableFull = String(toTableDisplayName || toTable).trim();
 
         fetch(ajaxUrl, {
           method: 'POST',
@@ -6217,8 +6928,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
               toDisplayName: toTableDisplayName,
               fromGlobalNum: fromTableNumber,
               toGlobalNum: toTableNumber,
-              orderTotal: data.data?.total || 0,
-              orderId: data.data?.order_id || null
+              orderTotal: data.data?.merged_total || data.data?.target_total || data.data?.total || 0,
+              orderId: data.data?.target_order_id || data.data?.order_id || null,
+              mergeMode: mergeMode
             });
           } else {
             throw new Error(data.data?.message || '<?php echo ruiyi_translate("Error del servidor", "Server error", "服务器错误"); ?>');
@@ -6228,46 +6940,62 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           console.error('换台失败:', error);
 
           // 🔥 回滚本地数据
-          if (mergeMode) {
-            // 合并模式：从快照恢复
-            if (backupSourceState) mesasEstado[effectiveFromKey] = backupSourceState;
-            else delete mesasEstado[effectiveFromKey];
-            if (backupSourceCart) carritosGuardados[effectiveFromKey] = backupSourceCart;
-            else delete carritosGuardados[effectiveFromKey];
-            if (backupTargetState) mesasEstado[toTable] = backupTargetState;
-            else delete mesasEstado[toTable];
-            if (backupTargetCart) carritosGuardados[toTable] = backupTargetCart;
-            else delete carritosGuardados[toTable];
-          } else {
-            // 换台模式的原回滚逻辑
-            if (mesasEstado[toTable]) {
-              mesasEstado[fromTable] = { ...mesasEstado[toTable] };
-              delete mesasEstado[toTable];
-            }
-            if (carritosGuardados[toTable]) {
-              carritosGuardados[fromTable] = { ...carritosGuardados[toTable] };
-              delete carritosGuardados[toTable];
-            }
-          }
+	          if (mergeMode) {
+	            // 合并模式：从快照恢复
+	            if (backupSourceState) mesasEstado[effectiveFromKey] = backupSourceState;
+	            else delete mesasEstado[effectiveFromKey];
+	            if (backupSourceCart) carritosGuardados[effectiveFromKey] = backupSourceCart;
+	            else delete carritosGuardados[effectiveFromKey];
+	            if (backupTargetState) mesasEstado[canonicalToKey] = backupTargetState;
+	            else delete mesasEstado[canonicalToKey];
+	            if (backupTargetCart) carritosGuardados[canonicalToKey] = backupTargetCart;
+	            else delete carritosGuardados[canonicalToKey];
+	          } else {
+	            // 换台模式的原回滚逻辑
+	            if (mesasEstado[canonicalToKey]) {
+	              mesasEstado[effectiveFromKey] = { ...mesasEstado[canonicalToKey] };
+	              delete mesasEstado[canonicalToKey];
+	            }
+	            if (carritosGuardados[canonicalToKey]) {
+	              carritosGuardados[effectiveFromKey] = { ...carritosGuardados[canonicalToKey] };
+	              delete carritosGuardados[canonicalToKey];
+	            }
+	          }
           localStorage.setItem('mesas_estado', JSON.stringify(mesasEstado));
           localStorage.setItem('carritos_mesas', JSON.stringify(carritosGuardados));
 
           // 显示错误
+          if (typeof ruiyiResetSwalLoadingState === 'function') {
+            ruiyiResetSwalLoadingState('switch-table-fetch-error');
+          }
           Swal.fire({
             icon: 'error',
             title: mergeMode
               ? '<?php echo ruiyi_translate("Error al fusionar mesa", "Error merging table", "拼桌失败"); ?>'
               : '<?php echo ruiyi_translate("Error al cambiar mesa", "Error switching table", "换台失败"); ?>',
-            text: error.message || '<?php echo ruiyi_translate("No se pudo completar la operación", "Could not complete the operation", "无法完成操作"); ?>'
+            text: error.message || '<?php echo ruiyi_translate("No se pudo completar la operación", "Could not complete the operation", "无法完成操作"); ?>',
+            didOpen: () => {
+              if (typeof ruiyiResetSwalLoadingState === 'function') {
+                ruiyiResetSwalLoadingState('switch-table-fetch-error-open');
+              }
+            }
           });
         });
         
       } catch (error) {
         console.error('换台验证失败:', error);
+        if (typeof ruiyiResetSwalLoadingState === 'function') {
+          ruiyiResetSwalLoadingState('switch-table-validation-error');
+        }
         Swal.fire({
           icon: 'error',
           title: '<?php echo ruiyi_translate("Error", "Error", "错误"); ?>',
-          text: error.message
+          text: error.message,
+          didOpen: () => {
+            if (typeof ruiyiResetSwalLoadingState === 'function') {
+              ruiyiResetSwalLoadingState('switch-table-validation-error-open');
+            }
+          }
         });
       }
     }
@@ -6341,17 +7069,21 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         delete carritosGuardados[key];
       }
 
-      // 🔥🔥🔥 使用显示名称作为新的 key
-      const newTargetKey = toDisplayName;
+	      // 🔥🔥🔥 使用稳定全局 key，显示名只保存为字段
+	      const newTargetKey = `Mesa ${toGlobalNum}`;
 
-      // 🔥 设置目标桌位的新状态（包含总额）
-      mesasEstado[newTargetKey] = {
-        estado: 'ocupada',
-        orderId: options.orderId || null,
-        total: orderTotal,
-        timestamp: new Date().toISOString(),
-        _skipAutoUpdate: true
-      };
+	      // 🔥 设置目标桌位的新状态（包含总额）
+	      mesasEstado[newTargetKey] = {
+	        estado: 'ocupada',
+	        orderId: options.orderId || null,
+	        total: orderTotal,
+	        timestamp: new Date().toISOString(),
+	        table_number: toDisplayName,
+	        table_global_number: String(toGlobalNum),
+	        canonical_table_key: newTargetKey,
+	        table_uid: `table:${toGlobalNum}`,
+	        _skipAutoUpdate: true
+	      };
 
       localStorage.setItem('mesas_estado', JSON.stringify(mesasEstado));
       localStorage.setItem('carritos_mesas', JSON.stringify(carritosGuardados));
@@ -7796,6 +8528,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         // 🔥 工具箱按钮：桌位模式下始终显示（无论是添加新订单还是viewMode）
         if (toolboxToggleBtn) {
           toolboxToggleBtn.classList.toggle('hidden', !isTableMode);
+        }
+        if (isTableMode && typeof ruiyiEnsureTableToolboxActionsVisible === 'function') {
+          ruiyiEnsureTableToolboxActionsVisible(tableNumber, 'updateProformaButtonVisibility');
         }
       }
     }
@@ -9791,8 +10526,12 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
     // Cargar carrito de una mesa
     function cargarCarritoMesa(mesa) {
       const carritosGuardados = JSON.parse(localStorage.getItem('carritos_mesas') || '{}');
-      if (carritosGuardados[mesa]) {
-        const carritoGuardado = carritosGuardados[mesa];
+      const mesaGlobal = (typeof ruiyiSafeResolveGlobalTableNumber === 'function')
+        ? ruiyiSafeResolveGlobalTableNumber(mesa)
+        : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(mesa) : '');
+      const mesaKey = mesaGlobal && /^\d+$/.test(String(mesaGlobal)) ? `Mesa ${mesaGlobal}` : mesa;
+      const carritoGuardado = carritosGuardados[mesaKey] || carritosGuardados[mesa];
+      if (carritoGuardado) {
         cart = carritoGuardado.carrito;
         
         
@@ -9829,6 +10568,11 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
     // Borrar carrito de una mesa
     function borrarCarritoMesa(mesa) {
       const carritosGuardados = JSON.parse(localStorage.getItem('carritos_mesas') || '{}');
+      const mesaGlobal = (typeof ruiyiSafeResolveGlobalTableNumber === 'function')
+        ? ruiyiSafeResolveGlobalTableNumber(mesa)
+        : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(mesa) : '');
+      const mesaKey = mesaGlobal && /^\d+$/.test(String(mesaGlobal)) ? `Mesa ${mesaGlobal}` : mesa;
+      delete carritosGuardados[mesaKey];
       delete carritosGuardados[mesa];
       localStorage.setItem('carritos_mesas', JSON.stringify(carritosGuardados));
     }
@@ -9865,19 +10609,28 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       const tableNumber = document.getElementById('table-number')?.value.trim();
       const viewMode = sessionStorage.getItem('tableViewMode');
       const isViewMode = viewMode ? JSON.parse(viewMode) : null;
+      const activeTableNumber = tableNumber || isViewMode?.table || (window._currentViewingTable ? `Mesa ${window._currentViewingTable}` : '');
+      const hasActiveTableContext = !!activeTableNumber;
+      const isTableOrderContext = orderType === 'servir' || hasActiveTableContext;
 
       // 🔥 修复：包括查看模式下的追加订单
       // 条件：堂食订单 + 有桌位号 + 购物车有未锁定且数量>0的商品
       // 注意：不再排除查看模式，因为查看模式下也可以追加产品
-      const hasUnlockedItems = cart.length > 0 && cart.some(item => !item.locked && item.quantity > 0);
+      const hasUnlockedItems = Array.isArray(cart) && cart.length > 0 && cart.some(item => !item.locked && parseFloat(item.quantity || 0) > 0);
 
       // 🔥🔥🔥 关键修复：也检查锁定产品是否被修改
       // window.cartModified 在修改锁定产品数量时会被设置为 true
       const hasModifiedLockedItems = window.cartModified === true;
+      const clearCtx = typeof ruiyiResolveTableClearContext === 'function'
+        ? ruiyiResolveTableClearContext(activeTableNumber)
+        : null;
+      const shouldClearEmptyTable = clearCtx && typeof ruiyiShouldClearEmptyTableContext === 'function'
+        ? ruiyiShouldClearEmptyTableContext(clearCtx)
+        : false;
 
-      return orderType === 'servir' &&
-             tableNumber &&
-             (hasUnlockedItems || hasModifiedLockedItems);
+      return isTableOrderContext &&
+             activeTableNumber &&
+             (hasUnlockedItems || hasModifiedLockedItems || shouldClearEmptyTable);
     }
 
     // 🔥🔥🔥 【2026-01-20 完全重写】静默自动保存桌位订单
@@ -9886,9 +10639,11 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
     async function autoSaveTableOrder(forceOptions = {}) {
       // 🔥【2026-04-07】支持 force 参数：用户显式触发的保存（结账/预结单）必须绕过 3 秒去抖
       // 兼容旧调用（无参或传字符串/布尔）：默认 force=false
-      const _forceFlag = (typeof forceOptions === 'object' && forceOptions !== null)
-        ? !!forceOptions.force
-        : false;
+      const _autoSaveOptions = (typeof forceOptions === 'object' && forceOptions !== null) ? forceOptions : {};
+      const _forceFlag = !!_autoSaveOptions.force;
+      const _showAutoSaveSuccessToast = _autoSaveOptions.showSuccessToast !== false;
+      const _showAutoSaveErrorDialog = _autoSaveOptions.showErrorDialog !== false;
+      const _allowEmptyTableClear = _autoSaveOptions.allowEmptyTableClear !== false;
 
       // 🔥🔥🔥【2026-04-07 关键修复】force 模式下，等待 in-flight sync 完成
       // 根因：用户快速操作时，前一次 sync 还在网络往返中，currentlySyncingItems 正包含在飞行中的商品。
@@ -9920,6 +10675,10 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         return false;
       }
 
+      if (typeof ruiyiResolveCurrentTableUiContext === 'function') {
+        ruiyiResolveCurrentTableUiContext('autoSaveTableOrder:preflight');
+      }
+
       // 🔥🔥🔥 【2026-03-29 关键修复】AA金额分单进行中或正在结算时，跳过自动保存
       // 防止 AA 结账过程��� autoSave 将旧 cart 写入 mesas_estado 导致重复订单
       if (typeof amountSplitState !== 'undefined' && (amountSplitState.isActive || _amountSplitFinalizing)) {
@@ -9931,9 +10690,26 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         return false;
       }
 
-      const table_number = document.getElementById('table-number')?.value.trim();
+      let table_number = document.getElementById('table-number')?.value.trim();
+      if (!table_number && typeof ruiyiResolveTableClearContext === 'function') {
+        const recoveredClearCtx = ruiyiResolveTableClearContext('');
+        if (recoveredClearCtx) {
+          table_number = recoveredClearCtx.table_display_name || recoveredClearCtx.canonical_table_key || '';
+          const tableNumberInput = document.getElementById('table-number');
+          if (tableNumberInput && table_number) {
+            tableNumberInput.value = table_number;
+          }
+          console.warn('[autoSaveTableOrder] table-number 为空，已从当前桌位上下文恢复:', table_number);
+        }
+      }
       if (!table_number) {
         return false;
+      }
+
+      // 桌位上下文已经存在时，自动保存必须按堂食订单处理。
+      // 首次从空桌进入时 session 可能还停在默认外卖模式，导致菜单切换自动保存被跳过或走错订单类型。
+      if (sessionStorage.getItem('tipoPedidoSeleccionado') !== 'servir') {
+        sessionStorage.setItem('tipoPedidoSeleccionado', 'servir');
       }
 
       // 🔥 记录保存开始时的桌位，用于异步回调中检查是否已切换
@@ -9957,9 +10733,70 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         }
       }
 
-      // 如果既没有新产品也没有修改锁定产品，直接返回
-      if (!hasNewItems && !hasModifiedLockedItems) {
+      const clearCtxForAutoSave = typeof ruiyiResolveTableClearContext === 'function'
+        ? ruiyiResolveTableClearContext(table_number)
+        : null;
+      const shouldClearEmptyTable = _allowEmptyTableClear && clearCtxForAutoSave && typeof ruiyiShouldClearEmptyTableContext === 'function'
+        ? ruiyiShouldClearEmptyTableContext(clearCtxForAutoSave)
+        : false;
+
+      // 如果既没有新产品、没有修改锁定产品，也不是清空已有桌位，直接返回
+      if (!hasNewItems && !hasModifiedLockedItems && !shouldClearEmptyTable) {
         return false;
+      }
+
+      if (shouldClearEmptyTable) {
+        const clearIsOffline = !navigator.onLine || window.RUIYI_POS?.isOnline === false;
+        console.log('[autoSaveTableOrder] 🧹 检测到空购物车桌位，开始同步清台:', clearCtxForAutoSave);
+        Swal.fire({
+          title: clearIsOffline
+            ? '<?php echo ruiyi_translate("Guardando limpieza offline...", "Saving clear offline...", "正在保存离线清台..."); ?>'
+            : '<?php echo ruiyi_translate("Limpiando mesa...", "Clearing table...", "正在清空桌位..."); ?>',
+          text: clearIsOffline
+            ? '<?php echo ruiyi_translate("Se sincronizará al recuperar conexión", "It will sync when connection returns", "恢复网络后会自动同步"); ?>'
+            : '<?php echo ruiyi_translate("Cancelando pedidos activos de la mesa", "Cancelling active table orders", "正在同步取消该桌位活动订单"); ?>',
+          allowOutsideClick: false,
+          allowEscapeKey: false,
+          didOpen: () => { Swal.showLoading(); }
+        });
+
+        try {
+          const clearResult = await ruiyiSyncClearTableOrder(clearCtxForAutoSave, {
+            source: 'auto-save-empty-table-return',
+            allowOfflineQueue: true
+          });
+          Swal.close();
+          if (typeof clearCurrentTable === 'function') {
+            clearCurrentTable();
+          } else {
+            cart = [];
+            window.cart = cart;
+            const tableNumberInput = document.getElementById('table-number');
+            if (tableNumberInput) tableNumberInput.value = '';
+            if (typeof renderCart === 'function') renderCart();
+          }
+          window.cartModified = false;
+          Toastify({
+            text: clearResult.offline
+              ? `✅ <?php echo ruiyi_translate('Mesa vaciada offline', 'Table cleared offline', '桌位已离线清空'); ?>`
+              : `✅ <?php echo ruiyi_translate('Mesa vaciada', 'Table cleared', '桌位已清空'); ?>`,
+            duration: 1800,
+            gravity: "top",
+            position: "center",
+            style: { background: clearResult.offline ? "#d97706" : "#10b981" }
+          }).showToast();
+          return true;
+        } catch (clearError) {
+          Swal.close();
+          console.error('[autoSaveTableOrder] ❌ 清空桌位同步失败:', clearError);
+          Swal.fire({
+            icon: 'error',
+            title: '<?php echo ruiyi_translate("No se pudo vaciar la mesa", "Could not clear table", "未能清空桌位"); ?>',
+            text: '<?php echo ruiyi_translate("La mesa no se marcará como libre hasta que el servidor confirme la limpieza.", "The table will not be marked free until the server confirms the clear operation.", "服务器确认清空前，不会把该桌位标为空闲。"); ?>',
+            confirmButtonColor: '#f7310f'
+          });
+          throw clearError;
+        }
       }
 
       // 🔥🔥🔥 关键修复：检查是否刚刚同步过，避免重复同步
@@ -10088,14 +10925,42 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         });
       }
 
-      // 2. 显示成功提示
-      Toastify({
-        text: `✅ <?php echo ruiyi_translate('Pedido guardado automáticamente', 'Order auto-saved', '订单已自动保存'); ?>`,
-        duration: 1500,
-        gravity: "top",
-        position: "center",
-        style: { background: "#10b981" }
-      }).showToast();
+      const _autoSaveIsOffline = !navigator.onLine || window.RUIYI_POS?.isOnline === false;
+      if (_autoSaveIsOffline) {
+        if (hasModifiedLockedItems && typeof syncCartToMesasEstado === 'function') {
+          syncCartToMesasEstado();
+        }
+
+        if (orderData && orderData.mesaKey) {
+          try {
+            const mesasEstadoOffline = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
+            if (mesasEstadoOffline[orderData.mesaKey]) {
+              mesasEstadoOffline[orderData.mesaKey]._offline = true;
+              mesasEstadoOffline[orderData.mesaKey]._pendingSync = true;
+              mesasEstadoOffline[orderData.mesaKey]._skipAutoUpdate = true;
+              localStorage.setItem('mesas_estado', JSON.stringify(mesasEstadoOffline));
+            }
+          } catch (offlineFlagError) {
+            console.warn('[autoSaveTableOrder] 离线保存标记失败:', offlineFlagError);
+          }
+        }
+
+        if (_showAutoSaveSuccessToast) {
+          Toastify({
+            text: `✅ <?php echo ruiyi_translate('Pedido guardado offline', 'Order saved offline', '订单已离线保存'); ?>`,
+            duration: 1500,
+            gravity: "top",
+            position: "center",
+            style: { background: "#d97706" }
+          }).showToast();
+        }
+
+        if (kitchenPrintQueue.length > 0) {
+          cart.forEach(item => { delete item.addedQuantity; });
+        }
+
+        return true;
+      }
 
       // 🔥🔥🔥 【2026-01-20 关键修复】执行顺序与手动保存完全一致
       // 关键修复（参考手动保存 line 11600-11605）：先更新锁定商品，再添加新商品
@@ -10140,10 +11005,10 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         if (orderData) {
           orderData.skipKitchenPrint = true; // 由统一打印盒子处理
           try {
-            await syncTableOrderToServer(orderData);
+            await ruiyiSyncTableOrderToServerWithRetry(orderData);
             console.log('[autoSaveTableOrder] ✅ 服务器同步完成');
           } catch (e) {
-            console.error('[🔍自动保存调试] ❌ 步骤2失败: syncTableOrderToServer 错误:', e);
+            console.error('[🔍自动保存调试] ❌ 步骤2失败: ruiyiSyncTableOrderToServerWithRetry 错误:', e);
             // 🔥🔥🔥 【2026-03-30 关键修复】同步失败时从 mesas_estado 恢复购物车
             // quickSaveTableOrder 已移除未锁定商品(line 9557)，同步失败则购物车为空
             // 导致结账时提示"没有商品"
@@ -10363,6 +11228,14 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
       } catch (e) {
         console.error('[🔍自动保存调试] ❌ 整体同步失败:', e);
+        if (_showAutoSaveErrorDialog) {
+          Swal.fire({
+            icon: 'error',
+            title: '<?php echo ruiyi_translate("Error al guardar", "Save failed", "保存失败"); ?>',
+            text: '<?php echo ruiyi_translate("No se pudo guardar el pedido. Inténtelo de nuevo.", "Could not save the order. Please try again.", "订单未能保存，请重试。"); ?>',
+            confirmButtonColor: '#f7310f'
+          });
+        }
         throw e;
       }
 
@@ -10383,6 +11256,16 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         cart.forEach(item => { delete item.addedQuantity; });
         // 🔥🔥🔥 【2026-01-20 关键修复】自动保存时不调用 renderCart()
         // 因为用户马上要切换模块，调用 renderCart() 会导致购物车金额闪烁
+      }
+
+      if (_showAutoSaveSuccessToast) {
+        Toastify({
+          text: `✅ <?php echo ruiyi_translate('Pedido guardado automáticamente', 'Order auto-saved', '订单已自动保存'); ?>`,
+          duration: 1500,
+          gravity: "top",
+          position: "center",
+          style: { background: "#10b981" }
+        }).showToast();
       }
 
       return true;
@@ -10416,9 +11299,52 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         else if (_qsKitchenLang === 'en' && item.name_en) kitchenName = item.name_en;
         return { name: kitchenName, quantity: item.addedQuantity, notes: item.notes || '' };
       });
-      const table_number = document.getElementById('table-number')?.value.trim();
+      const tableNumberInputEl = document.getElementById('table-number');
+      let table_number = tableNumberInputEl?.value.trim() || '';
+      const _quickSaveUiTableCtx = typeof ruiyiResolveCurrentTableUiContext === 'function'
+        ? ruiyiResolveCurrentTableUiContext('quickSaveTableOrder:preflight')
+        : null;
+      if (_quickSaveUiTableCtx?.globalNumber) {
+        table_number = _quickSaveUiTableCtx.displayName || `Mesa ${_quickSaveUiTableCtx.globalNumber}`;
+      }
+	      if (!table_number) {
+	        let fallbackTable = '';
+	        if (typeof ruiyiResolveActiveTableNumber === 'function') {
+	          fallbackTable = ruiyiResolveActiveTableNumber('', { preferFallback: false });
+	        }
+	        if (!fallbackTable) {
+	          try {
+	            const viewModeRaw = sessionStorage.getItem('tableViewMode') || sessionStorage.getItem('isViewMode');
+	            const viewMode = viewModeRaw ? JSON.parse(viewModeRaw) : null;
+	            if (viewMode && viewMode.table) {
+	              fallbackTable = typeof ruiyiResolveTableDisplayName === 'function'
+	                ? ruiyiResolveTableDisplayName(viewMode.table, viewMode.table)
+	                : viewMode.table;
+	            }
+	          } catch (e) { /* view mode fallback is best-effort */ }
+	        }
+	        if (!fallbackTable && window._currentViewingTable) {
+	          fallbackTable = typeof ruiyiResolveTableDisplayName === 'function'
+	            ? ruiyiResolveTableDisplayName(window._currentViewingTable, `Mesa ${window._currentViewingTable}`)
+	            : `Mesa ${window._currentViewingTable}`;
+	        }
+
+        if (fallbackTable) {
+          table_number = fallbackTable;
+          if (tableNumberInputEl) {
+            tableNumberInputEl.value = fallbackTable;
+          }
+          console.warn('[quickSaveTableOrder] table-number 为空，已用当前桌位上下文恢复:', fallbackTable);
+        }
+      }
 
       if (newItems.length === 0 || !table_number) {
+        console.warn('[quickSaveTableOrder] 无法准备保存:', {
+          newItems: newItems.length,
+          table_number,
+          currentViewingTable: window._currentViewingTable,
+          tableInputValue: tableNumberInputEl?.value || ''
+        });
         return null;
       }
 
@@ -10496,6 +11422,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
       const tableNum = _normalizedTableNum;
       const mesaKey = `Mesa ${tableNum}`;
+      const tableDisplayName = typeof ruiyiResolveTableDisplayName === 'function'
+        ? ruiyiResolveTableDisplayName(table_number, table_number)
+        : table_number;
       if (typeof ruiyiLogTerrazaDebug === 'function') {
         ruiyiLogTerrazaDebug('quickSaveTableOrder:local-state-key', {
           table_number,
@@ -10605,18 +11534,23 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       // 之前的 bug: `existingData._offline || true` 永远返回 true
       const isCurrentlyOffline = !navigator.onLine || window.RUIYI_POS?.isOnline === false;
 
-      mesasEstado[mesaKey] = {
-        estado: 'ocupada',
-        orderId: existingOrderId || tempOrderId,
-        timestamp: new Date().toISOString(),
-        total: tableTotal,
-        discount: window.currentDiscountPercent || 0,
+	      mesasEstado[mesaKey] = {
+	        estado: 'ocupada',
+	        orderId: existingOrderId || tempOrderId,
+	        timestamp: new Date().toISOString(),
+	        total: tableTotal,
+		        table_number: tableDisplayName,
+		        table_global_number: tableNum,
+		        canonical_table_key: mesaKey,
+		        table_uid: `table:${tableNum}`,
+	        discount: window.currentDiscountPercent || 0,
         cart: JSON.parse(JSON.stringify(cartToSave)),
         cart_gtn: parseInt(tableNum), // 🔥 cart 身份标签：标记此 cart 属于哪个 gtn
         orderNotes: existingData.orderNotes || window.currentOrderNotes || '', // 🔥 保留订单备注
         _pendingSync: true,  // 🔥 标记待同步
         _skipAutoUpdate: true,
         _offline: isCurrentlyOffline, // 🔥🔥🔥 【关键修复】只基于当前网络状态，不继承旧值，避免同步状态异常
+        _clientBatchId: tempOrderId,
         // 🔥 关键修复：同时设置两个字段，确保两个同步机制都能工作
         _newItemsToSync: mergedItems,
         _offlineNewItems: mergedItems,
@@ -10667,10 +11601,15 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       return {
         tempOrderId,
         existingOrderId,
-        table_number,
-        tableNum,
-        mesaKey,
-        newItems: JSON.parse(JSON.stringify(newItems)),
+        clientBatchId: tempOrderId,
+	        table_number,
+	        tableNum,
+	        mesaKey,
+	        tableDisplayName,
+	        tableGlobalNumber: tableNum,
+	        canonicalTableKey: mesaKey,
+	        tableUid: `table:${tableNum}`,
+	        newItems: JSON.parse(JSON.stringify(newItems)),
         kitchenPrintItems, // 🔥 厨房打印专用：包含锁定商品的新增部分
         tableTotal,
         isAddition
@@ -10695,12 +11634,45 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
       // 检查是否有锁定商品（需要同步数量修改）
       const hasLockedItems = cart && cart.some(item => item.locked && item.quantity > 0);
+      const hasModifiedLockedItems = window.cartModified === true ||
+        (cart && cart.some(item =>
+          item.locked &&
+          item.quantity > 0 &&
+          ((item.addedQuantity || 0) > 0 || item.quantityModified === true || item.isNew === true)
+        ));
 
       if (!hasUnlockedItems && !hasLockedItems) {
         return true;
       }
 
       try {
+        const isOffline = !navigator.onLine || window.RUIYI_POS?.isOnline === false;
+        if (isOffline) {
+          if (hasUnlockedItems) {
+            const offlineOrderData = quickSaveTableOrder(true);
+            if (offlineOrderData && offlineOrderData.mesaKey) {
+              try {
+                const mesasEstadoOffline = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
+                if (mesasEstadoOffline[offlineOrderData.mesaKey]) {
+                  mesasEstadoOffline[offlineOrderData.mesaKey]._offline = true;
+                  mesasEstadoOffline[offlineOrderData.mesaKey]._pendingSync = true;
+                  mesasEstadoOffline[offlineOrderData.mesaKey]._skipAutoUpdate = true;
+                  localStorage.setItem('mesas_estado', JSON.stringify(mesasEstadoOffline));
+                }
+              } catch (offlineFlagError) {
+                console.warn('[ensureTableOrderSaved] 离线保存标记失败:', offlineFlagError);
+              }
+            }
+          }
+
+          if (hasModifiedLockedItems && typeof syncCartToMesasEstado === 'function') {
+            syncCartToMesasEstado();
+          }
+
+          console.warn('[ensureTableOrderSaved] 离线模式：桌位变更已保存在本地，跳过服务器保存');
+          return true;
+        }
+
         // 1. 如果有未锁定商品，先保存新订单
         if (hasUnlockedItems) {
           // 调用自动保存函数
@@ -10717,7 +11689,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         }
 
         // 2. 同步锁定商品的数量修改到服务器
-        if (hasLockedItems) {
+        if (hasModifiedLockedItems) {
           await updateLockedItemsToServer();
 
           // 等待同步完成
@@ -10850,9 +11822,19 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       // 🔥 首先尝试直接使用原始桌位号查找
       let orderId = null;
       let foundKey = null;
+      const tableNumForOrderId = ruiyiSafeResolveGlobalTableNumber(table_number);
+      const canonicalTableKeyForOrderId = tableNumForOrderId && /^\d+$/.test(String(tableNumForOrderId))
+        ? `Mesa ${tableNumForOrderId}`
+        : null;
 
-      // 直接查找原始桌位号（如 "室内1" 或 "室内 1"）
-      if (mesasEstado[table_number] && mesasEstado[table_number].orderId) {
+      // 优先查稳定全局 key。
+      if (canonicalTableKeyForOrderId && mesasEstado[canonicalTableKeyForOrderId] && mesasEstado[canonicalTableKeyForOrderId].orderId) {
+        orderId = mesasEstado[canonicalTableKeyForOrderId].orderId;
+        foundKey = canonicalTableKeyForOrderId;
+      }
+
+      // 兼容旧 key：直接查找原始桌位号（如 "室内1" 或 "室内 1"）
+      if (!orderId && mesasEstado[table_number] && mesasEstado[table_number].orderId) {
         orderId = mesasEstado[table_number].orderId;
         foundKey = table_number;
       }
@@ -10860,7 +11842,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       // 如果没找到，尝试带空格的格式
       if (!orderId) {
         // 提取数字部分
-        const tableNum = ruiyiSafeResolveGlobalTableNumber(table_number);
+        const tableNum = tableNumForOrderId;
 
         // 多格式查找（使用标准前缀，支持任意区域名称）
         const possiblePrefixes = ['Mesa', 'Table', '餐桌'];
@@ -10917,6 +11899,54 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       const orderIdsArray = Array.from(allOrderIds).map(id => parseInt(id)).filter(id => id > 0);
       console.log('[🔍updateLockedItems调试] 订单ID列表:', orderIdsArray);
 
+      const tableGlobalNumberForUpdate = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+        ? String(ruiyiSafeResolveGlobalTableNumber(table_number) || '').replace(/\D/g, '')
+        : String(table_number || '').replace(/\D/g, '');
+      const tableDisplayNameForUpdate = typeof ruiyiResolveTableDisplayName === 'function'
+        ? ruiyiResolveTableDisplayName(table_number, table_number)
+        : table_number;
+
+      const allowedOrderIdsForCurrentTable = new Set();
+      const collectOrderIdsFromTableState = (state) => {
+        if (!state || typeof state !== 'object') return;
+        const addId = (value) => {
+          const cleanId = String(value ?? '').replace(/[^0-9]/g, '');
+          if (cleanId) allowedOrderIdsForCurrentTable.add(parseInt(cleanId, 10));
+        };
+        addId(state.orderId || state.order_id);
+        if (Array.isArray(state.orderIds)) {
+          state.orderIds.forEach(addId);
+        }
+        if (Array.isArray(state.orders)) {
+          state.orders.forEach(order => addId(order?.id || order?.order_id || order?.orderId || order?.order_number));
+        }
+        if (Array.isArray(state.cart)) {
+          state.cart.forEach(item => addId(item?.orderId || item?.order_id));
+        }
+      };
+
+      if (canonicalTableKeyForOrderId && mesasEstado[canonicalTableKeyForOrderId]) {
+        collectOrderIdsFromTableState(mesasEstado[canonicalTableKeyForOrderId]);
+      }
+      if (foundKey && foundKey !== 'item.orderId' && mesasEstado[foundKey]) {
+        collectOrderIdsFromTableState(mesasEstado[foundKey]);
+      }
+
+      if (allowedOrderIdsForCurrentTable.size > 0) {
+        const unexpectedOrderIds = orderIdsArray.filter(id => !allowedOrderIdsForCurrentTable.has(id));
+        if (unexpectedOrderIds.length > 0) {
+          console.error('[🔍updateLockedItems调试] 🚫 检测到锁定商品来自其他桌位，阻止同步:', {
+            table_number,
+            tableGlobalNumberForUpdate,
+            allowedOrderIds: Array.from(allowedOrderIdsForCurrentTable),
+            unexpectedOrderIds,
+            orderIdsArray
+          });
+          window._updateLockedItemsSyncInProgress = false;
+          throw new Error('TABLE_ORDER_MISMATCH');
+        }
+      }
+
       // 🔥🔥🔥 准备发送的数据
       const itemsToSend = lockedItems.map(item => {
         const currentQty = Math.max(0, parseInt(item.quantity || 0, 10) || 0);
@@ -10959,6 +11989,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           action: 'ruiyi_pos_update_order_items',
           order_id: orderId,
           all_order_ids: JSON.stringify(orderIdsArray), // 🔥 传递所有订单ID
+          table_number,
+          table_global_number: tableGlobalNumberForUpdate,
+          table_display_name: tableDisplayNameForUpdate,
           items: JSON.stringify(itemsToSend),
           nonce: window.RUIYI_POS?.nonce
         });
@@ -11160,13 +12193,17 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         // 🔥 supplements 已在弹窗关闭时合入 customName/customPrice，直接使用
         const syncRegularItems = syncNewItems.filter(i => !i.is_buffet);
 
-        const formData = new URLSearchParams({
-          action: 'ruiyi_pos_create_order',
-          cart: JSON.stringify(syncRegularItems),
-          table_number: orderData.table_number,
-          order_type: 'servir',
-          payment_method: 'Cash',
+	        const formData = new URLSearchParams({
+	          action: 'ruiyi_pos_create_order',
+	          cart: JSON.stringify(syncRegularItems),
+	          table_number: orderData.table_number,
+	          table_global_number: orderData.tableGlobalNumber || orderData.tableNum || '',
+	          table_display_name: orderData.tableDisplayName || orderData.table_number || '',
+	          table_uid: orderData.tableUid || (orderData.tableNum ? `table:${orderData.tableNum}` : ''),
+	          order_type: 'servir',
+	          payment_method: 'Cash',
           is_addition: orderData.isAddition ? 'true' : 'false',
+          client_batch_id: orderData.clientBatchId || orderData.tempOrderId || '',
           nonce: ajaxNonce
         });
         if (syncBuffetItems.length > 0) {
@@ -11248,6 +12285,11 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           const orderTotal = data.data?.total || data.total || orderData.tableTotal;
           const serverItems = data.data?.items; // 服务器可能返回items
           const syncVersion = data.data?.version || data.version || (Date.now() + '_' + Math.random().toString(36).substr(2, 4));
+
+          const realOrderIdText = String(realOrderId || '');
+          if (!realOrderId || realOrderIdText.startsWith('PENDING_') || realOrderIdText.startsWith('OFFLINE_') || !/^\d+$/.test(realOrderIdText)) {
+            throw new Error('TABLE_ORDER_SYNC_MISSING_ORDER_ID');
+          }
 
           console.log('[🔍syncTableOrder调试] ✅ 订单创建/更新成功');
           console.log('[🔍syncTableOrder调试] realOrderId:', realOrderId);
@@ -11465,6 +12507,12 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             }
           }
 
+          return {
+            orderId: realOrderId,
+            total: orderTotal,
+            version: syncVersion
+          };
+
         } else {
           throw new Error(data.message || 'Order creation failed');
         }
@@ -11529,6 +12577,27 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         console.log('[🔍syncTableOrder调试] ========== syncTableOrderToServer 结束 ==========');
       }
     }
+
+    async function ruiyiSyncTableOrderToServerWithRetry(orderData, maxAttempts = 2) {
+      let lastError = null;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const result = await syncTableOrderToServer(orderData);
+          if (!result || !result.orderId) {
+            throw new Error('TABLE_ORDER_SYNC_MISSING_ORDER_ID');
+          }
+          return result;
+        } catch (error) {
+          lastError = error;
+          console.warn('[saveTableOrderBtn] 桌位订单同步失败，尝试次数:', attempt, '/', maxAttempts, error);
+          if (attempt < maxAttempts) {
+            await new Promise(resolve => setTimeout(resolve, 800));
+          }
+        }
+      }
+      throw lastError || new Error('TABLE_ORDER_SYNC_FAILED');
+    }
+    window.ruiyiSyncTableOrderToServerWithRetry = ruiyiSyncTableOrderToServerWithRetry;
 
     // 🔥🔥🔥 【2026-01-19 关键修复】移除了重复的 online 事件处理程序
     // 之前这里有一个独立的 syncTableOrderToServer 调用，与 line 745-749 的 syncOfflineTableOrders 冲突
@@ -12564,10 +13633,14 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       );
     }
 
-    function canMergeUnlockedCartLine(item, productId, unitPrice) {
+    function canMergeUnlockedCartLine(item, productId, unitPrice, tableGlobal = '') {
+      const itemTableGlobal = item && (item._table_global_number || item.table_global_number || item.cart_gtn)
+        ? String(item._table_global_number || item.table_global_number || item.cart_gtn)
+        : '';
       return item &&
         item.id === productId &&
         !item.locked &&
+        (!tableGlobal || !itemTableGlobal || itemTableGlobal === String(tableGlobal)) &&
         !cartItemHasLineModifiers(item) &&
         Math.abs(getCartItemEffectivePrice(item) - parseFloat(unitPrice || 0)) < 0.01;
     }
@@ -12604,6 +13677,13 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       const name_es = card.getAttribute('data-name-es'); // 西班牙语名称（原产品名称）
       const name_zh = card.getAttribute('data-name-zh'); // 中文名称
       const name_en = card.getAttribute('data-name-en'); // 英文名称
+      const _productTableCtx = typeof ruiyiResolveCurrentTableUiContext === 'function'
+        ? ruiyiResolveCurrentTableUiContext('product-add:preflight')
+        : null;
+      const _productTableGlobal = _productTableCtx?.globalNumber || '';
+      if (typeof ruiyiDropCartIfTableContextMismatch === 'function') {
+        ruiyiDropCartIfTableContextMismatch(_productTableCtx, 'product-add:before-cart-push');
+      }
 
       // 🔥 获取基础价格和分区价格
       const basePrice = parseFloat(card.getAttribute('data-price'));
@@ -12654,7 +13734,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
       // 步骤1：先查找未锁定的相同产品（可以直接增加数量）
       // 🔥 关键：如果商品有customName（名称被修改）或备注，则不叠加
-      let existingItemIndex = cart.findIndex(item => canMergeUnlockedCartLine(item, id, price));
+      let existingItemIndex = cart.findIndex(item => canMergeUnlockedCartLine(item, id, price, _productTableGlobal));
 
       // 🔥🔥🔥【2026-04-08】不再合并到 locked 项 — 新添加的产品作为独立未锁定行显示
       // 用户期望：新产品独立显示，便于区分"已保存"和"新添加"；保存时由 sync return 路径自动合并。
@@ -12700,6 +13780,10 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           is_free: card.getAttribute('data-is-free') === '1', // 🔥 免费产品标记
           categoryIds: (card.getAttribute('data-categories') || '').split(' ').filter(c => c).map(Number) // 🔥 产品分类IDs（用于配料筛选）
         };
+        if (_productTableGlobal) {
+          cartItem._table_global_number = _productTableGlobal;
+          cartItem._table_display_name = _productTableCtx?.displayName || '';
+        }
 
         // 🔥 分区价格：如果实际价格与基础价格不同，设置 customPrice 确保后端使用正确价格
         if (!isBuffet && currentCategoryId && price !== basePrice) {
@@ -13854,16 +14938,306 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       }
 
       // 保存桌位订单按钮 - 🚀 PWA优化：使用乐观更新策略
+      function ruiyiResolveTableClearContext(rawTable = '') {
+        const candidates = [];
+        const pushCandidate = (value) => {
+          const normalized = String(value || '').trim();
+          if (normalized && !candidates.includes(normalized)) {
+            candidates.push(normalized);
+          }
+        };
+
+        pushCandidate(rawTable);
+        const hasExplicitTable = String(rawTable || '').trim() !== '';
+        if (!hasExplicitTable) {
+          pushCandidate(document.getElementById('table-number')?.value);
+          try {
+            const viewMode = typeof ruiyiGetActiveTableViewMode === 'function'
+              ? ruiyiGetActiveTableViewMode()
+              : JSON.parse(sessionStorage.getItem('tableViewMode') || sessionStorage.getItem('isViewMode') || 'null');
+            pushCandidate(viewMode?.table);
+          } catch (e) { /* best-effort */ }
+          if (window._currentViewingTable) {
+            pushCandidate(`Mesa ${window._currentViewingTable}`);
+          }
+        }
+
+        for (const candidate of candidates) {
+          const globalNumber = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+            ? ruiyiSafeResolveGlobalTableNumber(candidate)
+            : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(candidate) : '');
+          if (globalNumber && /^\d+$/.test(String(globalNumber))) {
+            const displayName = typeof ruiyiResolveTableDisplayName === 'function'
+              ? ruiyiResolveTableDisplayName(candidate, candidate)
+              : candidate;
+            return {
+              raw: candidate,
+              table_global_number: String(globalNumber),
+              table_display_name: displayName || `Mesa ${globalNumber}`,
+              canonical_table_key: `Mesa ${globalNumber}`,
+              table_uid: `table:${globalNumber}`
+            };
+          }
+        }
+
+        return null;
+      }
+
+      function ruiyiCartHasPositiveItems(items = cart) {
+        return Array.isArray(items) && items.some(item => {
+          const quantity = parseFloat(item?.quantity ?? 0);
+          return Number.isFinite(quantity) && quantity > 0;
+        });
+      }
+
+      function ruiyiFindTableStateByClearContext(ctx) {
+        if (!ctx || !ctx.table_global_number) return { key: null, data: null };
+
+        const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
+        const canonicalKey = ctx.canonical_table_key || `Mesa ${ctx.table_global_number}`;
+        const directKeys = [
+          canonicalKey,
+          ctx.table_display_name,
+          ctx.raw,
+          `Mesa ${ctx.table_global_number}`,
+          `Table ${ctx.table_global_number}`,
+          `餐桌 ${ctx.table_global_number}`
+        ].filter(Boolean);
+
+        for (const key of directKeys) {
+          if (mesasEstado[key]) {
+            return { key, data: mesasEstado[key] };
+          }
+        }
+
+        for (const [key, data] of Object.entries(mesasEstado)) {
+          const resolved = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+            ? ruiyiSafeResolveGlobalTableNumber(key)
+            : '';
+          if (String(resolved || '') === String(ctx.table_global_number)) {
+            return { key, data };
+          }
+        }
+
+        return { key: null, data: null };
+      }
+
+      function ruiyiTableStateLooksActiveForClear(state) {
+        if (!state || state._offlineClearPending) return false;
+        const status = String(state.estado || state.status || '').toLowerCase();
+        const hasOccupiedStatus = status && !['libre', 'free', 'available'].includes(status);
+        const hasOrderId = !!state.orderId || !!state.order_id || (Array.isArray(state.orderIds) && state.orderIds.length > 0);
+        const hasCartItems = Array.isArray(state.cart) && state.cart.some(item => parseFloat(item?.quantity ?? 0) > 0);
+        const hasTotal = parseFloat(state.total || 0) > 0;
+        return hasOccupiedStatus || hasOrderId || hasCartItems || hasTotal || state._pendingSync === true || state._hasOnlineOrder === true;
+      }
+
+      function ruiyiShouldClearEmptyTableContext(ctx) {
+        if (!ctx || !ctx.table_global_number) return false;
+        if (ruiyiCartHasPositiveItems(cart)) return false;
+
+        const stateMatch = ruiyiFindTableStateByClearContext(ctx);
+        if (ruiyiTableStateLooksActiveForClear(stateMatch.data)) {
+          return true;
+        }
+
+        if (window.cartModified === true) {
+          console.warn('[清空桌位] 跳过仅由 cartModified 触发的清台：未找到该桌位占用状态，避免跨分区误清台', ctx);
+        }
+        return false;
+      }
+
+      function ruiyiRemovePendingDeletesForTable(globalNumber) {
+        if (!globalNumber) return;
+        try {
+          const pendingDeletions = JSON.parse(localStorage.getItem('pending_locked_item_deletions') || '[]');
+          const filtered = pendingDeletions.filter(deletion => {
+            const deletionGlobal = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+              ? ruiyiSafeResolveGlobalTableNumber(deletion.table_number || deletion.table_global_number || '')
+              : '';
+            return String(deletionGlobal || '') !== String(globalNumber);
+          });
+          if (filtered.length !== pendingDeletions.length) {
+            localStorage.setItem('pending_locked_item_deletions', JSON.stringify(filtered));
+          }
+        } catch (e) {
+          console.warn('[清空桌位] 清理待同步删除队列失败:', e);
+        }
+      }
+
+      function ruiyiMarkTableClearedLocally(ctx, options = {}) {
+        if (!ctx || !ctx.table_global_number) return;
+
+        const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
+        const carritosGuardados = JSON.parse(localStorage.getItem('carritos_mesas') || '{}');
+        const key = ctx.canonical_table_key || `Mesa ${ctx.table_global_number}`;
+
+        mesasEstado[key] = {
+          estado: 'libre',
+          orderId: null,
+          orderIds: [],
+          total: 0,
+          cart: [],
+          timestamp: new Date().toISOString(),
+          table_number: ctx.table_display_name || key,
+          table_global_number: String(ctx.table_global_number),
+          canonical_table_key: key,
+          table_uid: ctx.table_uid || `table:${ctx.table_global_number}`
+        };
+
+        if (options.offlinePending) {
+          mesasEstado[key]._offlineClearPending = true;
+          mesasEstado[key]._pendingServerSync = true;
+          mesasEstado[key]._skipAutoUpdate = true;
+        }
+
+        for (const staleKey of Object.keys(mesasEstado)) {
+          if (staleKey === key) continue;
+          const staleGlobal = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+            ? ruiyiSafeResolveGlobalTableNumber(staleKey)
+            : '';
+          if (String(staleGlobal || '') === String(ctx.table_global_number) || staleKey === ctx.table_display_name) {
+            delete mesasEstado[staleKey];
+          }
+        }
+
+        for (const cartKey of Object.keys(carritosGuardados)) {
+          const cartGlobal = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+            ? ruiyiSafeResolveGlobalTableNumber(cartKey)
+            : '';
+          if (String(cartGlobal || '') === String(ctx.table_global_number) || cartKey === ctx.table_display_name || cartKey === key) {
+            delete carritosGuardados[cartKey];
+          }
+        }
+
+        localStorage.setItem('mesas_estado', JSON.stringify(mesasEstado));
+        localStorage.setItem('carritos_mesas', JSON.stringify(carritosGuardados));
+        ruiyiRemovePendingDeletesForTable(ctx.table_global_number);
+
+        window._recentlyCheckedOutTables = window._recentlyCheckedOutTables || {};
+        window._recentlyCheckedOutTables[String(ctx.table_global_number)] = Date.now();
+      }
+
+      function ruiyiQueuePendingTableClear(ctx, source = 'unknown') {
+        if (!ctx || !ctx.table_global_number) return;
+        const pendingClears = JSON.parse(localStorage.getItem('pending_table_clears') || '[]');
+        const withoutSameTable = pendingClears.filter(job => String(job.table_global_number || '') !== String(ctx.table_global_number));
+        withoutSameTable.push({
+          table_number: ctx.table_display_name || ctx.canonical_table_key,
+          table_display_name: ctx.table_display_name || ctx.canonical_table_key,
+          table_global_number: String(ctx.table_global_number),
+          canonical_table_key: ctx.canonical_table_key,
+          table_uid: ctx.table_uid,
+          source,
+          timestamp: new Date().toISOString()
+        });
+        localStorage.setItem('pending_table_clears', JSON.stringify(withoutSameTable));
+      }
+
+      async function ruiyiSyncClearTableOrder(ctx, options = {}) {
+        if (!ctx || !ctx.table_global_number) {
+          throw new Error('INVALID_TABLE_CONTEXT');
+        }
+
+        const isOffline = !navigator.onLine || window.RUIYI_POS?.isOnline === false;
+        if (isOffline) {
+          if (!options.allowOfflineQueue) {
+            throw new Error('OFFLINE');
+          }
+          ruiyiQueuePendingTableClear(ctx, options.source || 'clear-table');
+          ruiyiMarkTableClearedLocally(ctx, { offlinePending: true });
+          return { offline: true, queued: true };
+        }
+
+        const ajaxUrl = window.ajaxUrl || '<?php echo esc_url(admin_url("admin-ajax.php")); ?>';
+        const ajaxNonce = window.RUIYI_POS?.nonce || '<?php echo esc_js($ajax_nonce); ?>';
+        const cancelForm = new URLSearchParams({
+          action: 'ruiyi_pos_cancel_table_orders',
+          table_number: ctx.table_display_name || ctx.canonical_table_key,
+          table_global_number: String(ctx.table_global_number),
+          is_pos: 'yes',
+          nonce: ajaxNonce
+        });
+
+        const cancelResponse = await fetch(ajaxUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: cancelForm
+        });
+        if (!cancelResponse.ok) {
+          throw new Error(`HTTP ${cancelResponse.status}`);
+        }
+
+        const cancelData = await cancelResponse.json();
+        if (!cancelData.success) {
+          throw new Error(cancelData.data?.message || cancelData.message || 'CLEAR_TABLE_FAILED');
+        }
+
+        const statusForm = new URLSearchParams({
+          action: 'update_table_status',
+          table_id: String(ctx.table_global_number),
+          table_global_number: String(ctx.table_global_number),
+          table_display_name: ctx.table_display_name || ctx.canonical_table_key,
+          table_uid: ctx.table_uid || `table:${ctx.table_global_number}`,
+          status: 'available',
+          is_pos: 'yes',
+          nonce: ajaxNonce
+        });
+
+        const statusResponse = await fetch(ajaxUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: statusForm
+        });
+        if (!statusResponse.ok) {
+          throw new Error(`HTTP ${statusResponse.status}`);
+        }
+
+        const statusData = await statusResponse.json();
+        if (!statusData.success) {
+          throw new Error(statusData.data?.message || statusData.message || 'UPDATE_TABLE_STATUS_FAILED');
+        }
+
+        ruiyiMarkTableClearedLocally(ctx);
+        return { offline: false, cancelData, statusData };
+      }
+
+      window.ruiyiSyncClearTableOrder = ruiyiSyncClearTableOrder;
+      window.ruiyiResolveTableClearContext = ruiyiResolveTableClearContext;
+      window.ruiyiShouldClearEmptyTableContext = ruiyiShouldClearEmptyTableContext;
+
       const saveTableOrderBtn = document.getElementById('save-table-order-btn');
       if (saveTableOrderBtn) {
         saveTableOrderBtn.addEventListener('click', async function() {
-          // 🔥 保存开始时记录桌位，用于异步回调中检查
-          let _saveStartTable = window._currentViewingTable ? String(window._currentViewingTable) : null;
-          const _saveInputTable = document.getElementById('table-number')?.value.trim();
-          const _saveResolvedTableRaw = _saveInputTable
-            ? (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
-                ? ruiyiSafeResolveGlobalTableNumber(_saveInputTable)
-                : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(_saveInputTable) : null))
+          if (window._manualTableOrderSaveInProgress) {
+            console.warn('[saveTableOrderBtn] 保存正在进行中，忽略重复点击');
+            return;
+          }
+          window._manualTableOrderSaveInProgress = true;
+          const _manualSaveButton = this;
+          const _releaseManualSaveLock = () => {
+            window._manualTableOrderSaveInProgress = false;
+            if (_manualSaveButton) {
+              _manualSaveButton.disabled = false;
+              _manualSaveButton.classList.remove('opacity-60', 'pointer-events-none');
+            }
+          };
+          _manualSaveButton.disabled = true;
+          _manualSaveButton.classList.add('opacity-60', 'pointer-events-none');
+
+	          // 🔥 保存开始时记录桌位，用于异步回调中检查
+	          let _saveStartTable = window._currentViewingTable ? String(window._currentViewingTable) : null;
+	          const _saveUiTableCtx = typeof ruiyiResolveCurrentTableUiContext === 'function'
+	            ? ruiyiResolveCurrentTableUiContext('saveTableOrderBtn:preflight')
+	            : null;
+	          const _saveInputTable = document.getElementById('table-number')?.value.trim();
+	          const _saveActiveTable = typeof ruiyiResolveActiveTableNumber === 'function'
+	            ? ruiyiResolveActiveTableNumber(_saveInputTable || '', { preferFallback: false })
+	            : _saveInputTable;
+	          const _saveResolvedTableRaw = _saveInputTable
+	            ? (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+	                ? ruiyiSafeResolveGlobalTableNumber(_saveInputTable)
+	                : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(_saveInputTable) : null))
             : null;
           const _saveResolvedTable = _saveResolvedTableRaw !== null && _saveResolvedTableRaw !== undefined
             ? String(_saveResolvedTableRaw)
@@ -13873,13 +15247,75 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             _saveStartTable = _saveResolvedTable;
             console.log('[saveTableOrderBtn] 🔒 恢复当前桌位上下文:', _saveResolvedTable);
           }
+	          if (!_saveInputTable && _saveStartTable) {
+	            const _tableInputForSave = document.getElementById('table-number');
+	            if (_tableInputForSave) {
+	              _tableInputForSave.value = _saveActiveTable ||
+	                (typeof ruiyiResolveTableDisplayName === 'function'
+	                  ? ruiyiResolveTableDisplayName(_saveStartTable, `Mesa ${_saveStartTable}`)
+	                  : `Mesa ${_saveStartTable}`);
+	              console.warn('[saveTableOrderBtn] table-number 为空，已补回当前桌位:', _tableInputForSave.value);
+	            }
+	          }
 
           // 🔥 检查购物车是否为空或只有锁定的旧商品（没有新增商品）
           const hasNewItems = cart && cart.length > 0 && cart.some(item => item.locked !== true);
           // 🔥 检查是否有锁定产品的数量被修改
           const hasModifiedLockedItems = window.cartModified === true;
 
-          if (!cart || cart.length === 0 || (!hasNewItems && !hasModifiedLockedItems)) {
+          const hasPositiveCartItemsForManualSave = typeof ruiyiCartHasPositiveItems === 'function'
+            ? ruiyiCartHasPositiveItems(cart)
+            : (Array.isArray(cart) && cart.some(item => parseFloat(item?.quantity ?? 0) > 0));
+          const clearCtx = typeof ruiyiResolveTableClearContext === 'function'
+            ? ruiyiResolveTableClearContext(_saveActiveTable || _saveInputTable || (_saveStartTable ? `Mesa ${_saveStartTable}` : ''))
+            : null;
+          const shouldClearManualSaveTable = !hasPositiveCartItemsForManualSave &&
+            clearCtx &&
+            typeof ruiyiShouldClearEmptyTableContext === 'function' &&
+            ruiyiShouldClearEmptyTableContext(clearCtx);
+
+          if (shouldClearManualSaveTable) {
+              const clearIsOffline = !navigator.onLine || window.RUIYI_POS?.isOnline === false;
+              Swal.fire({
+                title: clearIsOffline
+                  ? '<?php echo ruiyi_translate("Guardando limpieza offline...", "Saving clear offline...", "正在保存离线清台..."); ?>'
+                  : '<?php echo ruiyi_translate("Limpiando mesa...", "Clearing table...", "正在清空桌位..."); ?>',
+                text: clearIsOffline
+                  ? '<?php echo ruiyi_translate("Se sincronizará al recuperar conexión", "It will sync when connection returns", "恢复网络后会自动同步"); ?>'
+                  : '<?php echo ruiyi_translate("Cancelando pedidos activos de la mesa", "Cancelling active table orders", "正在同步取消该桌位活动订单"); ?>',
+                allowOutsideClick: false,
+                allowEscapeKey: false,
+                didOpen: () => { Swal.showLoading(); }
+              });
+
+              try {
+                const clearResult = await ruiyiSyncClearTableOrder(clearCtx, {
+                  source: 'save-empty-table',
+                  allowOfflineQueue: true
+                });
+                Swal.close();
+                Toastify({
+                  text: clearResult.offline
+                    ? `✅ <?php echo ruiyi_translate('Mesa vaciada offline', 'Table cleared offline', '桌位已离线清空'); ?>`
+                    : `✅ <?php echo ruiyi_translate('Mesa vaciada', 'Table cleared', '桌位已清空'); ?>`,
+                  duration: 1800,
+                  gravity: "top",
+                  position: "center",
+                  style: { background: clearResult.offline ? "#d97706" : "#10b981" }
+                }).showToast();
+              } catch (clearError) {
+                Swal.close();
+                console.error('[saveTableOrderBtn] ❌ 清空桌位同步失败:', clearError);
+                _releaseManualSaveLock();
+                Swal.fire({
+                  icon: 'error',
+                  title: '<?php echo ruiyi_translate("No se pudo vaciar la mesa", "Could not clear table", "未能清空桌位"); ?>',
+                  text: '<?php echo ruiyi_translate("La mesa no se marcará como libre hasta que el servidor confirme la limpieza.", "The table will not be marked free until the server confirms the clear operation.", "服务器确认清空前，不会把该桌位标为空闲。"); ?>',
+                  confirmButtonColor: '#f7310f'
+                });
+                return;
+              }
+
             // 退出桌位模式
             if (typeof clearCurrentTable === 'function') {
               clearCurrentTable();
@@ -13902,7 +15338,39 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
               }
             }, 100);
 
+            _releaseManualSaveLock();
             return; // ✅ 不继续执行保存逻辑
+          }
+
+          if (!hasNewItems && !hasModifiedLockedItems) {
+            console.log('[saveTableOrderBtn] ✅ 当前桌位没有新增/修改商品，保留活动订单并返回桌位模块');
+            Toastify({
+              text: `✅ <?php echo ruiyi_translate('Pedido guardado', 'Order saved', '订单已保存'); ?>`,
+              duration: 1500,
+              gravity: "top",
+              position: "center",
+              style: { background: "#10b981" }
+            }).showToast();
+
+            window._skipAutoSaveInCambiarSeccion = true;
+            if (typeof clearCurrentTable === 'function') {
+              clearCurrentTable();
+            }
+            if (typeof cambiarSeccion === 'function') {
+              cambiarSeccion('mesas');
+            } else {
+              const mesasLink = document.querySelector('a[href="#mesas"]');
+              if (mesasLink) {
+                mesasLink.click();
+              }
+            }
+            setTimeout(() => {
+              if (typeof renderizarMesas === 'function') {
+                renderizarMesas('manual-save-no-changes');
+              }
+            }, 100);
+            _releaseManualSaveLock();
+            return;
           }
 
           // 🔥🔥🔥 关键修复（2024-01）：先更新锁定商品，再添加新商品
@@ -13976,8 +15444,33 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
           // 🚀 PWA优化：使用快速保存（乐观更新）
           // 1. 立即更新本地状态（只有新增产品时才调用）
+          const _saveOriginalCartSnapshot = JSON.parse(JSON.stringify(cart || []));
+          const _savePreviousMesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
           const orderData = hasNewItems ? quickSaveTableOrder() : null;
+          const _saveTableForPostSave = (orderData && orderData.table_number)
+            ? orderData.table_number
+            : (document.getElementById('table-number')?.value.trim() || (_saveStartTable ? `Mesa ${_saveStartTable}` : ''));
+          const _saveTableNumForPostSave = (orderData && orderData.tableNum)
+            ? String(orderData.tableNum)
+            : (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+                ? String(ruiyiSafeResolveGlobalTableNumber(_saveTableForPostSave) || '')
+                : String((_saveTableForPostSave || '').replace(/^(餐桌|Mesa|Table)\s*/i, '')));
+          const _saveMesaKeyForPostSave = (orderData && orderData.mesaKey)
+            ? orderData.mesaKey
+            : (_saveTableNumForPostSave ? `Mesa ${_saveTableNumForPostSave}` : '');
           let _saveServerSyncAlreadyDone = false;
+          const _saveIsOffline = !navigator.onLine || window.RUIYI_POS?.isOnline === false;
+
+          if (hasNewItems && !orderData) {
+            _releaseManualSaveLock();
+            Swal.fire({
+              icon: 'error',
+              title: '<?php echo ruiyi_translate("Error al guardar", "Save failed", "保存失败"); ?>',
+              text: '<?php echo ruiyi_translate("No se pudo preparar el pedido para guardar. Inténtelo de nuevo.", "Could not prepare the order for saving. Please try again.", "订单未能准备保存，请重试。"); ?>',
+              confirmButtonColor: '#f7310f'
+            });
+            return;
+          }
 
           // 🔥🔥🔥 【2026-05-03 修复】手动保存必须等服务器确认后再离开桌位
           // 原问题：先提示"已保存"并跳回桌位页，随后才后台同步。
@@ -13992,7 +15485,25 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           });
 
           try {
-            if (hasModifiedLockedItems) {
+            if (_saveIsOffline) {
+              console.warn('[saveTableOrderBtn] 📡 离线保存桌位订单：已写入本地，等待恢复网络后同步');
+              if (hasModifiedLockedItems && typeof syncCartToMesasEstado === 'function') {
+                syncCartToMesasEstado();
+              }
+              if (orderData && orderData.mesaKey) {
+                try {
+                  const mesasEstadoOffline = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
+                  if (mesasEstadoOffline[orderData.mesaKey]) {
+                    mesasEstadoOffline[orderData.mesaKey]._offline = true;
+                    mesasEstadoOffline[orderData.mesaKey]._pendingSync = true;
+                    mesasEstadoOffline[orderData.mesaKey]._skipAutoUpdate = true;
+                    localStorage.setItem('mesas_estado', JSON.stringify(mesasEstadoOffline));
+                  }
+                } catch (offlineFlagError) {
+                  console.warn('[saveTableOrderBtn] 离线保存标记失败:', offlineFlagError);
+                }
+              }
+            } else if (hasModifiedLockedItems) {
               if (window._optimisticDeleteSyncTimer) {
                 clearTimeout(window._optimisticDeleteSyncTimer);
                 window._optimisticDeleteSyncTimer = null;
@@ -14001,9 +15512,13 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
               window.cartModified = false;
             }
 
-            if (orderData) {
+            if (!_saveIsOffline && orderData) {
               orderData.skipKitchenPrint = true; // 由统一打印盒子处理
-              await syncTableOrderToServer(orderData);
+              // 手动保存必须拿到 WooCommerce 真实订单 ID 后才返回桌位模块。
+              // 否则慢网络/500 错误时会出现“提示已保存，但桌位稍后变空”的假成功状态。
+              const _manualSaveSyncPromise = ruiyiSyncTableOrderToServerWithRetry(orderData);
+              window._lastManualTableOrderSyncPromise = _manualSaveSyncPromise;
+              await _manualSaveSyncPromise;
             }
 
             _saveServerSyncAlreadyDone = true;
@@ -14012,21 +15527,27 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             Swal.close();
             console.error('[saveTableOrderBtn] ❌ 服务器保存失败，留在当前桌位:', e);
             try {
-              if (orderData && orderData.mesaKey) {
-                const mesasEstadoRecover = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
-                const tableDataRecover = mesasEstadoRecover[orderData.mesaKey];
-                if (tableDataRecover?.cart && tableDataRecover.cart.length > 0) {
-                  cart = tableDataRecover.cart.filter(item => item.quantity > 0);
-                  window.cart = cart;
-                  if (typeof ruiyiSetCartTableIdentity === 'function') {
-                    ruiyiSetCartTableIdentity(orderData.table_number || orderData.tableNum, 'saveTableOrderBtn:recover-after-sync-failure');
-                  }
-                  if (typeof renderCart === 'function') renderCart();
+              if (!_saveIsOffline && orderData && orderData.mesaKey) {
+                const mesasEstadoRollback = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
+                if (Object.prototype.hasOwnProperty.call(_savePreviousMesasEstado, orderData.mesaKey)) {
+                  mesasEstadoRollback[orderData.mesaKey] = _savePreviousMesasEstado[orderData.mesaKey];
+                } else {
+                  delete mesasEstadoRollback[orderData.mesaKey];
                 }
+                localStorage.setItem('mesas_estado', JSON.stringify(mesasEstadoRollback));
+              }
+              if (_saveOriginalCartSnapshot && _saveOriginalCartSnapshot.length > 0) {
+                cart = _saveOriginalCartSnapshot.filter(item => item.quantity > 0);
+                window.cart = cart;
+                if (orderData && typeof ruiyiSetCartTableIdentity === 'function') {
+                  ruiyiSetCartTableIdentity(orderData.table_number || orderData.tableNum, 'saveTableOrderBtn:recover-after-sync-failure');
+                }
+                if (typeof renderCart === 'function') renderCart();
               }
             } catch (recoverErr) {
               console.error('[saveTableOrderBtn] ❌ 恢复购物车失败:', recoverErr);
             }
+            _releaseManualSaveLock();
             Swal.fire({
               icon: 'error',
               title: '<?php echo ruiyi_translate("Error al guardar", "Save failed", "保存失败"); ?>',
@@ -14038,16 +15559,31 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
           // 2. 显示成功提示（无论是新增产品还是修改锁定产品）
           Toastify({
-            text: `✅ <?php echo ruiyi_translate('Pedido guardado', 'Order saved', '订单已保存'); ?>`,
+            text: _saveIsOffline
+              ? `✅ <?php echo ruiyi_translate('Pedido guardado offline', 'Order saved offline', '订单已离线保存'); ?>`
+              : `✅ <?php echo ruiyi_translate('Pedido guardado', 'Order saved', '订单已保存'); ?>`,
             duration: 1500,
             gravity: "top",
             position: "center",
-            style: { background: "#10b981" }
+            style: { background: _saveIsOffline ? "#d97706" : "#10b981" }
           }).showToast();
 
           // 3. 服务器确认保存后跳转到桌位模块
           // 🔥🔥🔥 设置跳过标记，避免cambiarSeccion再次触发autoSaveTableOrder显示重复提示
           window._skipAutoSaveInCambiarSeccion = true;
+          if (typeof ruiyiClearSavedTableOrderContext === 'function') {
+            ruiyiClearSavedTableOrderContext('saveTableOrderBtn:post-success');
+          } else {
+            window._currentViewingTable = null;
+            if (typeof ruiyiSetCartTableIdentity === 'function') {
+              ruiyiSetCartTableIdentity('', 'saveTableOrderBtn:post-success');
+            }
+            const _savedTableInput = document.getElementById('table-number');
+            if (_savedTableInput) _savedTableInput.value = '';
+            cart = [];
+            window.cart = cart;
+            window.cartModified = false;
+          }
           if (typeof cambiarSeccion === 'function') {
             cambiarSeccion('mesas');
           } else {
@@ -14068,6 +15604,10 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           // 防止后续异步回调（syncTableOrderToServer）将旧桌位商品写入 cart
           // 同时防止 handleTableSelection 触发冗余的 autoSaveTableOrder
           window._currentViewingTable = null;
+          if (typeof ruiyiSetCartTableIdentity === 'function') {
+            ruiyiSetCartTableIdentity('', 'saveTableOrderBtn:post-success-final');
+          }
+          window.cartModified = false;
 
           // 5. 🔥🔥🔥 关键修复：按正确顺序后台同步
           // 🔥🔥🔥 修复（2024-01）：必须先更新锁定商品，后添加新商品
@@ -14100,7 +15640,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           if (orderData && !_saveServerSyncAlreadyDone) {
             orderData.skipKitchenPrint = true; // 由统一打印盒子处理
             try {
-              await syncTableOrderToServer(orderData);
+              await ruiyiSyncTableOrderToServerWithRetry(orderData);
             } catch (e) {
               // 新商品同步失败静默处理
             }
@@ -14109,9 +15649,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           // 8. 🔥 统一打印厨房小票（从打印盒子）
           if (kitchenPrintQueue.length > 0 && window.clodopConfig?.enabled && window.clodopConfig?.kitchenPrinter) {
             // 检查外送区域 + 设置中配置的跳过分区
-            const table_number_for_print = document.getElementById('table-number')?.value.trim();
-            const isDeliveryZoneForPrint = typeof isDeliveryZoneTable === 'function' ? isDeliveryZoneTable(table_number_for_print) : false;
-            const isSkipZoneForPrint = typeof shouldSkipKitchenPrintForTable === 'function' ? shouldSkipKitchenPrintForTable(table_number_for_print) : false;
+              const table_number_for_print = _saveTableForPostSave;
+              const isDeliveryZoneForPrint = typeof isDeliveryZoneTable === 'function' ? isDeliveryZoneTable(table_number_for_print) : false;
+              const isSkipZoneForPrint = typeof shouldSkipKitchenPrintForTable === 'function' ? shouldSkipKitchenPrintForTable(table_number_for_print) : false;
 
             if (isSkipZoneForPrint) {
               console.log('[saveTableOrderBtn] 🚫 该分区已设置跳过厨房打印，不打印');
@@ -14119,8 +15659,8 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
               console.log('[saveTableOrderBtn] 🚚 外送区域桌位，跳过厨房打印（将在预结单时打印）');
             } else {
               // 获取订单ID
-              const tableNum = (table_number_for_print || '').replace(/^(餐桌|Mesa|Table)\s*/, '');
-              const mesaKey = `Mesa ${tableNum}`;
+              const tableNum = _saveTableNumForPostSave || (table_number_for_print || '').replace(/^(餐桌|Mesa|Table)\s*/i, '');
+              const mesaKey = _saveMesaKeyForPostSave || `Mesa ${tableNum}`;
               const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
               const printOrderId = mesasEstado[mesaKey]?.orderId || '';
 
@@ -14271,12 +15811,12 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             defaultPrinter: window.clodopConfig?.defaultPrinter || '(未设置)'
           });
           if (window.clodopConfig?.kitchenCategoryFilterEnabled && window.clodopConfig?.kitchenCopyToDefault && cashierKitchenPrintQueue.length > 0 && window.clodopConfig?.enabled && window.clodopConfig?.defaultPrinter) {
-            const table_number_for_cashier = document.getElementById('table-number')?.value.trim();
+            const table_number_for_cashier = _saveTableForPostSave;
             const isDeliveryForCashier = typeof isDeliveryZoneTable === 'function' ? isDeliveryZoneTable(table_number_for_cashier) : false;
             console.log('[saveTableOrderBtn] 🔍 收银台厨房小票: 桌号=', table_number_for_cashier, '外送区域=', isDeliveryForCashier);
             if (!isDeliveryForCashier) {
-              const tableNumC = (table_number_for_cashier || '').replace(/^(餐桌|Mesa|Table)\s*/, '');
-              const mesaKeyC = `Mesa ${tableNumC}`;
+              const tableNumC = _saveTableNumForPostSave || (table_number_for_cashier || '').replace(/^(餐桌|Mesa|Table)\s*/i, '');
+              const mesaKeyC = _saveMesaKeyForPostSave || `Mesa ${tableNumC}`;
               const mesasEstadoC = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
               const printOrderIdC = mesasEstadoC[mesaKeyC]?.orderId || '';
 
@@ -14301,6 +15841,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
               }
             }
           }
+          _releaseManualSaveLock();
         });
       }
 
@@ -14492,6 +16033,10 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       
       // 外卖结账函数
       function startTakeawayCheckout() {
+          if (typeof ruiyiClearTableContextForTakeawayCheckout === 'function') {
+              ruiyiClearTableContextForTakeawayCheckout('startTakeawayCheckout');
+          }
+
           // 🔥 过滤掉数量为0的商品
           const validCartItems = cart.filter(item => item.quantity > 0);
 
@@ -14517,6 +16062,10 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       
       // 显示外卖结账模态窗（带客户信息功能）
       function showTakeawayCheckoutModal(totalAmount, cartItems, autoSelectCash = false) {
+          if (typeof ruiyiClearTableContextForTakeawayCheckout === 'function') {
+              ruiyiClearTableContextForTakeawayCheckout('showTakeawayCheckoutModal');
+          }
+
           // 🔥 将 enterKeyHandler 定义在外部作用域，以便 willClose 可以访问
           let lastEnterTime = 0;
           let enterKeyHandler = null;
@@ -15661,6 +17210,10 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
       // 处理外卖订单创建
       function processTakeawayOrder(checkoutData, cartItems, totalAmount) {
+          if (typeof ruiyiClearTableContextForTakeawayCheckout === 'function') {
+              ruiyiClearTableContextForTakeawayCheckout('processTakeawayOrder');
+          }
+
           var ajaxUrl = window.ajaxUrl || '<?php echo admin_url('admin-ajax.php'); ?>';
           var ajaxNonce = window.RUIYI_POS?.nonce || posNonce;
 
@@ -15869,7 +17422,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
               PaymentQueue.addPayment(takeawayPaymentData).then(queueId => {
                   // 🔥 关键修复：如果 addPayment 返回 null（IndexedDB 不可用），
                   // 直接通过 AJAX 同步到服务器，不依赖队列
-                  if (!queueId && navigator.onLine) {
+                  if (!queueId && isOnline) {
                       console.warn('[秒结账] IndexedDB 不可用，直接同步外卖订单到服务器');
                       PaymentQueue.syncTakeawayPayment(takeawayPaymentData).then(result => {
                           if (result && result.success) {
@@ -15880,12 +17433,22 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
                       }).catch(err => {
                           console.error('[秒结账] ❌ 外卖订单直接同步异常:', err);
                       });
+                  } else if (!queueId && !isOnline && typeof submitOrderUniversal === 'function') {
+                      console.warn('[秒结账] IndexedDB支付队列不可用，使用离线订单队列保存外卖订单');
+                      submitOrderUniversal({ ...orderParams, skipCartClear: true }).catch(err => {
+                          console.error('[秒结账] ❌ 外卖订单离线备用保存失败:', err);
+                      });
                   }
               }).catch(err => {
                   // 🔥 队列失败时也尝试直接同步
-                  if (navigator.onLine) {
+                  if (isOnline) {
                       console.warn('[秒结账] addPayment 失败，直接同步外卖订单到服务器');
                       PaymentQueue.syncTakeawayPayment(takeawayPaymentData).catch(err => console.error('[PaymentQueue] syncTakeawayPayment fallback failed:', err.message));
+                  } else if (typeof submitOrderUniversal === 'function') {
+                      console.warn('[秒结账] addPayment 离线失败，使用离线订单队列保存外卖订单');
+                      submitOrderUniversal({ ...orderParams, skipCartClear: true }).catch(err => {
+                          console.error('[秒结账] ❌ 外卖订单离线备用保存失败:', err);
+                      });
                   }
                   Toastify({
                       text: '⚠️ <?php echo ruiyi_translate("Sincronización pendiente", "Sync pending", "同步待处理"); ?>',
@@ -16414,10 +17977,13 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             });
 
             try {
-              const saveSuccess = await ensureTableOrderSaved();
-              Swal.close();
-
-              if (!saveSuccess) {
+	              const saveSuccess = await ensureTableOrderSaved();
+	              Swal.close();
+	              if (typeof ruiyiResetSwalLoadingState === 'function') {
+	                ruiyiResetSwalLoadingState('checkout-table-after-save');
+	              }
+	
+	              if (!saveSuccess) {
                 Swal.fire({
                   icon: 'error',
                   title: '<?php echo ruiyi_translate("Error", "Error", "错误"); ?>',
@@ -18835,7 +20401,24 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
       // Online: Get table order data from server
       _fetchAfterSync()
-      .then(data => {
+      .then(async data => {
+        const latestViewingTable = window._currentViewingTable !== undefined &&
+          window._currentViewingTable !== null &&
+          window._currentViewingTable !== ''
+          ? String(window._currentViewingTable)
+          : '';
+        const responseTable = resolvedTable !== undefined && resolvedTable !== null ? String(resolvedTable) : '';
+        if (!latestViewingTable || (responseTable && latestViewingTable !== responseTable)) {
+          console.warn('[viewTableOrder] ⚠️ 旧桌位请求已返回，但当前桌位已切换，忽略响应:', {
+            requestTable: tableNumber,
+            responseTable,
+            latestViewingTable
+          });
+          if (typeof Swal !== 'undefined' && Swal.isVisible && Swal.isVisible()) {
+            Swal.close();
+          }
+          return;
+        }
         tableDebugLog('viewTableOrder', '后端返回', { table: tableNumber, resolved: resolvedTable, success: data.success, orderCount: (data.data && data.data.orders) ? data.data.orders.length : 0 });
         if (data.success && data.data && data.data.orders && data.data.orders.length > 0) {
           // 🔥🔥🔥 【2026-01-31 关键修复】过滤掉已结账但待同步的订单
@@ -18873,6 +20456,19 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
               }).showToast();
               return;
             }
+          }
+
+          if (Array.isArray(data.data.orders) && data.data.orders.length > 1) {
+            console.warn('[viewTableOrder] ⚠️ 同一桌位检测到多个活跃订单，这是异常历史数据；结账将兼容处理，但不应作为正常流程。', {
+              tableNumber,
+              resolvedTable,
+              orderIds: data.data.orders.map(order => order.id || order.order_number || null).filter(Boolean),
+              orderTables: data.data.orders.map(order => ({
+                id: order.id || order.order_number || null,
+                table_number: order.table_number || order.tableNumber || order.table || null,
+                status: order.status || null
+              }))
+            });
           }
 
           // 保存订单数据到sessionStorage
@@ -18917,68 +20513,52 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
           if (_noOrderData && _noOrderData._pendingSync === true &&
               _noOrderData.cart && Array.isArray(_noOrderData.cart) && _noOrderData.cart.length > 0) {
-            console.log('[viewTableOrder] 🔄 服务器无订单但本地有待同步数据，使用本地数据并重试同步');
+            console.log('[viewTableOrder] 🔄 服务器无订单但本地有待同步数据，阻止进入桌位并等待WC订单创建');
 
-            // 使用本地数据构建 orderData
-            const _pendingOrderData = {
-              orders: [{
-                id: _noOrderData.orderId || 'PENDING_' + Date.now(),
-                items: _noOrderData.cart.map((item, idx) => {
-                  const _price = parseFloat(item.customPrice !== undefined && item.customPrice !== null ? item.customPrice : (item.price || 0));
-                  return {
-                  product_id: item.id || item.product_id || Date.now() + Math.random(),
-                  id: item.id || item.product_id || Date.now() + Math.random(),
-                  name: item.customName || item.name || '',
-                  name_es: item.name_es || item.name || '',
-                  name_zh: item.name_zh || '',
-                  name_en: item.name_en || '',
-                  quantity: item.quantity,
-                  price: _price,
-                  original_price: item._originalPrice || item.price || item.customPrice,
-                  total: _price * item.quantity,
-                  image_url: item.image_url || '/wp-content/themes/RUIYI_POS-Manager/assets/images/placeholder.png',
-                  item_id: item.itemId || item.item_id || `pending_item_${idx}_${Date.now()}`,
-                  customName: item.customName || null
-                };}),
-                total: _noOrderData.total || 0,
-                status: 'processing'
-              }]
-            };
+            Swal.update({
+              title: '<?php echo ruiyi_translate("Sincronizando pedido...", "Syncing order...", "订单同步中..."); ?>',
+              text: '<?php echo ruiyi_translate("Estamos guardando el pedido en WooCommerce. Espere un momento.", "The order is being saved to WooCommerce. Please wait.", "正在将桌位订单保存到 WooCommerce，请稍候。"); ?>'
+            });
 
-            sessionStorage.setItem('tableOrderData', JSON.stringify(_pendingOrderData));
+            const _retryKey = _noOrderResult.key || `Mesa ${_noOrderTableNum}`;
+            const _pendingItems = Array.isArray(_noOrderData._newItemsToSync) && _noOrderData._newItemsToSync.length > 0
+              ? _noOrderData._newItemsToSync
+              : (_noOrderData.cart || []).filter(item => item && item.quantity > 0);
 
-            // 切换到收银模块并加载
-            const cajeroLinkPending = document.querySelector('a[href="#cajero"]');
-            if (cajeroLinkPending) {
-              document.querySelectorAll('main > section').forEach(section => section.classList.add('hidden'));
-              const cajeroSectionPending = document.getElementById('cajero');
-              if (cajeroSectionPending) cajeroSectionPending.classList.remove('hidden');
-              document.querySelectorAll('.menu-link').forEach(link => link.classList.remove('bg-red-600', 'text-white'));
-              cajeroLinkPending.classList.add('bg-red-600', 'text-white');
-              loadTableOrderToCart(tableNumber, _pendingOrderData);
+            try {
+              if (_pendingItems.length > 0 && typeof ruiyiSyncTableOrderToServerWithRetry === 'function') {
+                await ruiyiSyncTableOrderToServerWithRetry({
+                  mesaKey: _retryKey,
+                  table_number: resolvedTable ? `Mesa ${resolvedTable}` : tableNumber,
+                  tableNum: _noOrderTableNum,
+                  newItems: _pendingItems,
+                  tableTotal: _noOrderData.total || 0,
+                  isAddition: false,
+                  tempOrderId: _noOrderData.orderId || _noOrderData._clientBatchId || ('PENDING_' + Date.now()),
+                  clientBatchId: _noOrderData._clientBatchId || _noOrderData.orderId || ''
+                }, 2);
+              } else {
+                await waitForPendingSync(_retryKey, 15000);
+              }
+
+              const _refetched = await fetchTableOrdersWithRetry(resolvedTable ? `Mesa ${resolvedTable}` : tableNumber);
+              if (_refetched?.success && _refetched.data?.orders?.length > 0) {
+                Swal.close();
+                setTimeout(() => viewTableOrder(tableNumber, _refetched.data.orders[0]?.id || null), 50);
+                return;
+              }
+
+              throw new Error('TABLE_ORDER_SYNC_STILL_MISSING_WC_ORDER');
+            } catch (_syncWaitError) {
+              console.error('[viewTableOrder] ❌ 等待WC订单创建失败:', _syncWaitError);
+              Swal.fire({
+                icon: 'warning',
+                title: '<?php echo ruiyi_translate("Pedido sincronizándose", "Order syncing", "订单同步中"); ?>',
+                text: '<?php echo ruiyi_translate("El pedido todavía no existe en WooCommerce. Espere unos segundos y vuelva a tocar la mesa.", "The order does not exist in WooCommerce yet. Wait a few seconds and tap the table again.", "WooCommerce 后台还没有检测到这张订单，请稍等几秒后再点击该桌位。"); ?>',
+                confirmButtonColor: '#f59e0b'
+              });
+              return;
             }
-
-            Swal.close();
-
-            // 尝试重新同步到服务器
-            if (_noOrderData._newItemsToSync && _noOrderData._newItemsToSync.length > 0) {
-              const _retryKey = _noOrderResult.key || `Mesa ${_noOrderTableNum}`;
-              console.log('[viewTableOrder] 🔄 触发重新同步...');
-              setTimeout(() => {
-                if (typeof syncTableOrderToServer === 'function') {
-                  syncTableOrderToServer({
-                    mesaKey: _retryKey,
-                    table_number: tableNumber,
-                    tableNum: _noOrderTableNum,
-                    newItems: _noOrderData._newItemsToSync,
-                    tableTotal: _noOrderData.total || 0,
-                    isAddition: false
-                  });
-                }
-              }, 500);
-            }
-
-            return;
           }
 
           tableDebugLog('viewTableOrder', '⚠️ 无订单 - 将清除本地状态', { table: tableNumber, resolved: resolveGlobalTableNumber(tableNumber) });
@@ -19142,15 +20722,29 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       window.cart = cart;
 
       // 设置桌号
-      const cleanTableNumber = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
-        ? ruiyiSafeResolveGlobalTableNumber(tableNumber)
-        : resolveGlobalTableNumber(tableNumber);
-      if (typeof ruiyiSetCartTableIdentity === 'function') {
-        ruiyiSetCartTableIdentity(cleanTableNumber, 'loadTableOrderToCart');
-      }
-      document.getElementById('table-number').value = cleanTableNumber;
-      // 🔥 更新购物车上方的桌位号显示
-      updateCurrentTableDisplay(cleanTableNumber);
+	      const cleanTableNumber = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+	        ? ruiyiSafeResolveGlobalTableNumber(tableNumber)
+	        : resolveGlobalTableNumber(tableNumber);
+	      const displayTableNumber = typeof ruiyiResolveTableDisplayName === 'function'
+	        ? ruiyiResolveTableDisplayName(tableNumber, tableNumber)
+	        : tableNumber;
+	      if (typeof ruiyiSetCartTableIdentity === 'function') {
+	        ruiyiSetCartTableIdentity(cleanTableNumber, 'loadTableOrderToCart');
+	      }
+	      document.getElementById('table-number').value = displayTableNumber || cleanTableNumber;
+	      // 🔥 更新购物车上方的桌位号显示
+	      updateCurrentTableDisplay(displayTableNumber || cleanTableNumber);
+	      try {
+	        const viewMode = typeof ruiyiGetActiveTableViewMode === 'function' ? ruiyiGetActiveTableViewMode() : null;
+	        if (viewMode && viewMode.mode === 'view') {
+	          viewMode.table = displayTableNumber || viewMode.table || tableNumber;
+	          const viewModePayload = JSON.stringify(viewMode);
+	          sessionStorage.setItem('tableViewMode', viewModePayload);
+	          sessionStorage.setItem('isViewMode', viewModePayload);
+	        }
+	      } catch (error) {
+	        console.warn('[loadTableOrderToCart] 更新桌位显示上下文失败:', error);
+	      }
 
       // 🔥 【关键修复】恢复折扣状态 - 使用多格式key查找
       const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
@@ -19709,6 +21303,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
         // 处理分类数据
         if (categoriesData.success && categoriesData.data.categories) {
+          window.tableCategories = categoriesData.data.categories;
           renderCategoryButtons(categoriesData.data.categories);
 
           // 🔥 构建分类ID映射和delivery启用列表
@@ -19804,7 +21399,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         // 🔥 如果 IndexedDB 已标记为损坏，返回空
         if (window._indexedDBBroken) return [];
         return new Promise((resolve, reject) => {
-          const request = indexedDB.open('RUIYI_POS_DB', 2); // Use version 2 to match other functions
+          const request = indexedDB.open('RUIYI_POS_DB', 3); // Match offline payment queue schema
           request.onerror = () => {
             console.error('[PWA] IndexedDB open error:', request.error);
             window._indexedDBBroken = true; // 🔥 标记损坏
@@ -19812,13 +21407,45 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           };
           request.onupgradeneeded = (event) => {
             const db = event.target.result;
+            if (!db.objectStoreNames.contains('pending_orders')) {
+              const pendingStore = db.createObjectStore('pending_orders', { keyPath: 'id', autoIncrement: false });
+              pendingStore.createIndex('timestamp', 'timestamp', { unique: false });
+              pendingStore.createIndex('status', 'status', { unique: false });
+            }
+            if (!db.objectStoreNames.contains('products')) {
+              const productsStore = db.createObjectStore('products', { keyPath: 'id' });
+              productsStore.createIndex('category', 'category', { unique: false });
+              productsStore.createIndex('name', 'name', { unique: false });
+            }
+            if (!db.objectStoreNames.contains('categories')) {
+              db.createObjectStore('categories', { keyPath: 'id' });
+            }
             if (!db.objectStoreNames.contains('customers')) {
               const store = db.createObjectStore('customers', { keyPath: 'id' });
               store.createIndex('email', 'email', { unique: false });
             }
+            if (!db.objectStoreNames.contains('tables')) {
+              const tablesStore = db.createObjectStore('tables', { keyPath: 'tableId' });
+              tablesStore.createIndex('status', 'status', { unique: false });
+            }
+            if (!db.objectStoreNames.contains('settings')) {
+              db.createObjectStore('settings', { keyPath: 'key' });
+            }
+            if (!db.objectStoreNames.contains('sync_queue')) {
+              const syncStore = db.createObjectStore('sync_queue', { keyPath: 'id', autoIncrement: true });
+              syncStore.createIndex('type', 'type', { unique: false });
+              syncStore.createIndex('timestamp', 'timestamp', { unique: false });
+            }
+            if (!db.objectStoreNames.contains('pending_payments')) {
+              const paymentStore = db.createObjectStore('pending_payments', { keyPath: 'id', autoIncrement: false });
+              paymentStore.createIndex('timestamp', 'timestamp', { unique: false });
+              paymentStore.createIndex('status', 'status', { unique: false });
+              paymentStore.createIndex('type', 'type', { unique: false });
+            }
           };
           request.onsuccess = () => {
             const db = request.result;
+            db.onversionchange = () => db.close();
             
             // Check if store exists
             if (!db.objectStoreNames.contains('customers')) {
@@ -21895,6 +23522,73 @@ ${window.RUIYI_TRANS.createLayout}
       return { data: null, key: null };
     }
 
+    function getTableCategorySortMap() {
+      const sortMap = new Map();
+
+      if (Array.isArray(window.tableCategories)) {
+        window.tableCategories.forEach((category, index) => {
+          if (!category || category.id === undefined || category.id === 'all') {
+            return;
+          }
+          const sortOrder = parseInt(category.sort_order, 10);
+          const normalizedSort = Number.isFinite(sortOrder) ? sortOrder : index;
+          sortMap.set(String(category.id), (normalizedSort * 10000) + index);
+        });
+      }
+
+      if (window.tableCategoriesById && typeof window.tableCategoriesById === 'object') {
+        Object.values(window.tableCategoriesById).forEach((category, index) => {
+          if (!category || category.id === undefined || sortMap.has(String(category.id))) {
+            return;
+          }
+          const sortOrder = parseInt(category.sort_order, 10);
+          const normalizedSort = Number.isFinite(sortOrder) ? sortOrder : index;
+          sortMap.set(String(category.id), (normalizedSort * 10000) + index);
+        });
+      }
+
+      document.querySelectorAll('#category-filter-container .category-filter-btn[data-category]').forEach((button, index) => {
+        const categoryId = button.getAttribute('data-category');
+        if (!categoryId || categoryId === 'all' || sortMap.has(String(categoryId))) {
+          return;
+        }
+        sortMap.set(String(categoryId), index);
+      });
+
+      return sortMap;
+    }
+
+    function getSortedTableCategoryMappings(mappings) {
+      const list = Array.isArray(mappings) ? mappings.slice() : Object.values(mappings || {});
+      const sortMap = getTableCategorySortMap();
+
+      return list.sort((a, b) => {
+        const categoryA = String(a?.category_id ?? '');
+        const categoryB = String(b?.category_id ?? '');
+        const categoryIdA = parseInt(categoryA, 10);
+        const categoryIdB = parseInt(categoryB, 10);
+        const sortA = sortMap.has(categoryA) ? sortMap.get(categoryA) : 999999 + (Number.isFinite(categoryIdA) ? categoryIdA : 0);
+        const sortB = sortMap.has(categoryB) ? sortMap.get(categoryB) : 999999 + (Number.isFinite(categoryIdB) ? categoryIdB : 0);
+
+        if (sortA !== sortB) {
+          return sortA - sortB;
+        }
+
+        const localA = parseInt(a?.table_number_in_category ?? a?.local_table_number ?? a?.table_number ?? 0, 10);
+        const localB = parseInt(b?.table_number_in_category ?? b?.local_table_number ?? b?.table_number ?? 0, 10);
+        const normalizedLocalA = Number.isFinite(localA) ? localA : 0;
+        const normalizedLocalB = Number.isFinite(localB) ? localB : 0;
+
+        if (normalizedLocalA !== normalizedLocalB) {
+          return normalizedLocalA - normalizedLocalB;
+        }
+
+        const globalA = parseInt(a?.global_table_number ?? 0, 10);
+        const globalB = parseInt(b?.global_table_number ?? 0, 10);
+        return (Number.isFinite(globalA) ? globalA : 0) - (Number.isFinite(globalB) ? globalB : 0);
+      });
+    }
+
     // 实际渲染餐桌网格的函数
     function renderizarMesasActual(customTableFilter = null) {
         // 如果没有传入过滤器，使用全局过滤器
@@ -21919,7 +23613,7 @@ ${window.RUIYI_TRANS.createLayout}
       // 获取所有桌位的分类映射，根据分类过滤显示
       if (currentCategoryFilter === 'all') {
         // 显示所有桌位，使用分类显示名称
-        const allMappings = Object.values(tableCategoryMappings);
+        const allMappings = getSortedTableCategoryMappings(tableCategoryMappings);
 
         // 如果有分类映射，显示分类桌位名称
         if (allMappings.length > 0) {
@@ -21968,6 +23662,7 @@ ${window.RUIYI_TRANS.createLayout}
               mesaId: mesaId,
               displayName: categoryDisplayName, // 显示分类名称
               globalNumber: globalNumber,
+              mapping: mapping,
               categoryId: mapping.category_id ? parseInt(mapping.category_id) : null
             });
           });
@@ -22013,13 +23708,14 @@ ${window.RUIYI_TRANS.createLayout}
               index: i,
               mesaId: mesaId,
               displayName: mesaId,
-              globalNumber: i
+              globalNumber: i,
+              mapping: null
             });
           }
         }
       } else {
         // 显示特定分类的桌位，使用分类显示名称
-        const categoryTables = Object.values(tableCategoryMappings).filter(mapping =>
+        const categoryTables = getSortedTableCategoryMappings(tableCategoryMappings).filter(mapping =>
           mapping.category_id == currentCategoryFilter
         );
 
@@ -22062,13 +23758,14 @@ ${window.RUIYI_TRANS.createLayout}
             index: globalNumber,
             mesaId: mesaId, // 后端识别用全局编号
             displayName: categoryDisplayName, // 前端显示用分类名称
-            globalNumber: globalNumber
+            globalNumber: globalNumber,
+            mapping: mapping
           });
         });
       }
 
       // 渲染收集到的餐桌
-      tablesToRender.forEach(({ index, mesaId, displayName, globalNumber }) => {
+      tablesToRender.forEach(({ index, mesaId, displayName, globalNumber, mapping }) => {
         // 🔥 使用多格式查找桌位数据
         const carritoResult = findCarritoByNumber(carritosGuardados, globalNumber);
         const estadoResult = findTableDataByNumber(mesasEstado, globalNumber);
@@ -22343,10 +24040,10 @@ ${window.RUIYI_TRANS.createLayout}
         let totalMesaHtml = '';
         
         // 使用临时变量存储AJAX异步加载的数据ID，后续异步更新
-        const mesaDataId = `mesa-total-${index}`;
-        
-        const mesaElement = document.createElement('div');
-        mesaElement.className = `mesa-item relative ${estadoClasses.bg} ${estadoClasses.border} ${estadoClasses.text} border rounded-lg p-1 shadow-sm hover:shadow-md transition-all cursor-pointer`;
+	        const mesaDataId = `mesa-total-${index}`;
+	        
+	        const mesaElement = document.createElement('div');
+	        mesaElement.className = `mesa-item relative ${estadoClasses.bg} ${estadoClasses.border} ${estadoClasses.text} border rounded-lg p-1 shadow-sm hover:shadow-md transition-all cursor-pointer`;
         // 🔥 如果有自定义背景颜色，应用内联样式
         if (estadoClasses.customBg) {
           mesaElement.style.backgroundColor = estadoClasses.customBg;
@@ -22355,16 +24052,28 @@ ${window.RUIYI_TRANS.createLayout}
         if (estadoClasses.customText) {
           mesaElement.style.color = estadoClasses.customText;
         }
-        mesaElement.setAttribute('data-mesa', mesaId);
-        mesaElement.setAttribute('data-estado', estado);
-        if (estadoMesa && estadoMesa.orderId) {
-          mesaElement.setAttribute('data-order-id', estadoMesa.orderId);
-        }
-        
-        // 获取显示名称：分类过滤时显示分类名称，全部显示时显示Mesa编号
-        const tableDisplayName = displayName || mesaId;
+	        // 获取显示名称：分类过滤时显示分类名称，全部显示时显示Mesa编号
+		        const tableDisplayName = displayName || mesaId;
+		        mesaElement.setAttribute('data-mesa', tableDisplayName);
+		        mesaElement.setAttribute('data-global-table-number', String(globalNumber));
+		        mesaElement.setAttribute('data-canonical-table-key', `Mesa ${globalNumber}`);
+		        mesaElement.setAttribute('data-table-uid', `table:${globalNumber}`);
+		        if (mapping && mapping.table_id) {
+		          mesaElement.setAttribute('data-table-id', String(mapping.table_id));
+		        }
+		        if (mapping && mapping.category_id !== undefined && mapping.category_id !== null) {
+		          mesaElement.setAttribute('data-category-id', String(mapping.category_id));
+		        }
+		        if (mapping && mapping.table_number_in_category !== undefined && mapping.table_number_in_category !== null) {
+		          mesaElement.setAttribute('data-local-table-number', String(mapping.table_number_in_category));
+		        }
+		        mesaElement.setAttribute('data-table-display-name', tableDisplayName);
+		        mesaElement.setAttribute('data-estado', estado);
+	        if (estadoMesa && estadoMesa.orderId) {
+	          mesaElement.setAttribute('data-order-id', estadoMesa.orderId);
+	        }
 
-        // 🔥 桌位名称分行显示处理
+	        // 🔥 桌位名称分行显示处理
         const nameSplitEnabled = window.RUIYI_POS_CONFIG?.tableNameSplit || false;
         let tableNameHtml = escapeHtml(tableDisplayName);
         if (nameSplitEnabled && tableDisplayName) {
@@ -22625,6 +24334,9 @@ ${window.RUIYI_TRANS.createLayout}
           }
 
           const mesaSeleccionada = element.getAttribute('data-mesa');
+          const mesaGlobalSeleccionada = element.getAttribute('data-global-table-number') || '';
+          const mesaCanonicalSeleccionada = mesaGlobalSeleccionada ? `Mesa ${mesaGlobalSeleccionada}` : mesaSeleccionada;
+          const mesaDisplaySeleccionada = mesaSeleccionada || mesaCanonicalSeleccionada;
           const estadoMesa = element.getAttribute('data-estado');
           const fallbackOrderId = element.getAttribute('data-order-id') || null;
 
@@ -22635,19 +24347,53 @@ ${window.RUIYI_TRANS.createLayout}
 
           // 🔥 选择新桌位前，自动保存当前桌位的未保存订单
           const currentTable = document.getElementById('table-number')?.value.trim();
-          if (currentTable && currentTable !== mesaSeleccionada) {
-            await autoSaveTableOrder();
+          const currentTableGlobal = currentTable && typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+            ? String(ruiyiSafeResolveGlobalTableNumber(currentTable) || '')
+            : '';
+          const selectedTableGlobal = mesaGlobalSeleccionada || (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+            ? String(ruiyiSafeResolveGlobalTableNumber(mesaCanonicalSeleccionada) || '')
+            : '');
+          const isSwitchingTable = currentTable && (
+            (currentTableGlobal && selectedTableGlobal && currentTableGlobal !== selectedTableGlobal) ||
+            (!currentTableGlobal && !selectedTableGlobal && currentTable !== mesaDisplaySeleccionada)
+          );
+          if (isSwitchingTable) {
+            const hasUnsavedPositiveItemsForSwitch = Array.isArray(cart) && cart.some(item => {
+              const quantity = parseFloat(item?.quantity ?? 0);
+              if (!Number.isFinite(quantity) || quantity <= 0) return false;
+              return item.locked !== true ||
+                     (parseFloat(item?.addedQuantity ?? 0) > 0) ||
+                     item.quantityModified === true ||
+                     item.isNew === true;
+            });
+            const hasModifiedLockedItemsForSwitch = window.cartModified === true;
+
+            if (hasUnsavedPositiveItemsForSwitch || hasModifiedLockedItemsForSwitch) {
+              await autoSaveTableOrder({
+                force: true,
+                source: 'table-card-switch',
+                allowEmptyTableClear: false
+              });
+            } else {
+              console.log('[桌位切换] 当前桌位没有待保存新增/修改，跳过清台型自动保存:', {
+                currentTable,
+                currentTableGlobal,
+                nextTable: mesaDisplaySeleccionada,
+                selectedTableGlobal,
+                cartCount: Array.isArray(cart) ? cart.length : 0
+              });
+            }
           }
           
           // 如果桌位是占用状态或结算中状态，直接调用查看功能
           if (estadoMesa === 'ocupada' || estadoMesa === 'solicitud_cuenta' || estadoMesa === 'liquidando') {
-            viewTableOrder(mesaSeleccionada, fallbackOrderId);
+            viewTableOrder(mesaCanonicalSeleccionada, fallbackOrderId);
             return;
           }
 
           // 🔥 检查是否是 delivery 区域，如果是则先弹出客户信息输入框
-          if (isDeliveryZoneTable(mesaSeleccionada)) {
-            const proceed = await promptDeliveryCustomerInfo(mesaSeleccionada);
+          if (isDeliveryZoneTable(mesaCanonicalSeleccionada)) {
+            const proceed = await promptDeliveryCustomerInfo(mesaCanonicalSeleccionada);
             if (!proceed) {
               return;
             }
@@ -22655,11 +24401,11 @@ ${window.RUIYI_TRANS.createLayout}
 
           // 🍽️ 自助餐开台：空闲桌位 + 自助餐模式 + 非外送区域 → 弹窗输入就餐人数
           if (window.buffetConfig && window.buffetConfig.enabled &&
-              !isDeliveryZoneTable(mesaSeleccionada) &&
+              !isDeliveryZoneTable(mesaCanonicalSeleccionada) &&
               estadoMesa !== 'ocupada' && estadoMesa !== 'solicitud_cuenta') {
-            const buffetResult = await showBuffetOpenTablePopup(mesaSeleccionada);
+            const buffetResult = await showBuffetOpenTablePopup(mesaDisplaySeleccionada);
             if (!buffetResult.confirmed) return;
-            handleTableSelectionConfirmed(mesaSeleccionada, estadoMesa);
+            handleTableSelectionConfirmed(mesaCanonicalSeleccionada, estadoMesa);
             if (buffetResult.items.length > 0) {
               setTimeout(() => addBuffetOpenTableItemsToCart(buffetResult.items), 100);
             }
@@ -22667,7 +24413,7 @@ ${window.RUIYI_TRANS.createLayout}
           }
 
           // 直接确认选择桌位，跳过确认弹窗
-          handleTableSelectionConfirmed(mesaSeleccionada, estadoMesa);
+          handleTableSelectionConfirmed(mesaCanonicalSeleccionada, estadoMesa);
         }
         
         // 触摸开始
@@ -23180,13 +24926,58 @@ ${window.RUIYI_TRANS.createLayout}
         delete window._skipAutoSaveInCambiarSeccion;
         // 直接跳到显示目标页面，跳过同步
       } else {
-        // 🔥🔥🔥 【2026-01-20 关键修复】不使用 await 等待自动保存
-        // autoSaveTableOrder 内部调用 quickSaveTableOrder 立即更新本地状态
-        // 然后后台异步同步服务器，不需要等待
-        // 这样切换模块时立即响应，无延迟
-        autoSaveTableOrder();
-        // 注意：autoSaveTableOrder 内部已经处理了 updateLockedItemsToServer（异步不等待）
-        // 不需要再次调用
+        try {
+          let autoSavedInSectionSwitch = false;
+          const tableNumberBeforeAutoSave = document.getElementById('table-number')?.value.trim() || '';
+          const hasTableChangesBeforeSwitch = typeof hasUnsavedTableOrder === 'function'
+            ? hasUnsavedTableOrder()
+            : false;
+          let tableContextBeforeSectionSwitch = '';
+          if (seccionId === 'mesas') {
+            try {
+              const viewModeBeforeSection = typeof window.ruiyiGetActiveTableViewMode === 'function'
+                ? window.ruiyiGetActiveTableViewMode()
+                : JSON.parse(sessionStorage.getItem('tableViewMode') || sessionStorage.getItem('isViewMode') || 'null');
+              tableContextBeforeSectionSwitch = tableNumberBeforeAutoSave ||
+                viewModeBeforeSection?.table ||
+                (window._currentViewingTable ? `Mesa ${window._currentViewingTable}` : '');
+            } catch (contextError) {
+              console.warn('[模块切换] 读取桌位上下文失败:', contextError);
+            }
+          }
+          const clearCtxBeforeAutoSave = typeof ruiyiResolveTableClearContext === 'function'
+            ? ruiyiResolveTableClearContext(tableNumberBeforeAutoSave)
+            : null;
+          const shouldAwaitClearBeforeTables = clearCtxBeforeAutoSave && typeof ruiyiShouldClearEmptyTableContext === 'function'
+            ? ruiyiShouldClearEmptyTableContext(clearCtxBeforeAutoSave)
+            : false;
+
+          if (hasTableChangesBeforeSwitch) {
+            if (shouldAwaitClearBeforeTables) {
+              console.log('[模块切换] 🧹 切换模块前等待空桌位清台同步:', clearCtxBeforeAutoSave);
+            } else {
+              console.log('[模块切换] ⏳ 切换模块前等待桌位订单保存完成');
+            }
+            autoSavedInSectionSwitch = await autoSaveTableOrder({ force: true, source: shouldAwaitClearBeforeTables ? 'switch-clear-empty-table' : 'switch-save-table-order' });
+          } else {
+            autoSavedInSectionSwitch = await autoSaveTableOrder({ source: 'section-switch-no-changes' });
+          }
+
+          if (seccionId === 'mesas' &&
+              tableContextBeforeSectionSwitch &&
+              typeof clearCurrentTable === 'function' &&
+              (autoSavedInSectionSwitch || !hasTableChangesBeforeSwitch)) {
+            console.log('[模块切换] ✅ 返回桌位模块，清理当前桌位上下文:', {
+              tableContextBeforeSectionSwitch,
+              autoSavedInSectionSwitch,
+              hasTableChangesBeforeSwitch
+            });
+            clearCurrentTable();
+          }
+        } catch (autoSaveError) {
+          console.error('[模块切换] ❌ 自动保存/清台失败，取消切换模块:', autoSaveError);
+          return;
+        }
       }
 
       // 🔥🔥🔥 关键修复：切换模块前，确保快速结账/外卖模式购物车已保存到localStorage
@@ -23272,6 +25063,24 @@ ${window.RUIYI_TRANS.createLayout}
           const alpineData = Alpine.$data(cartActionsContainer);
           if (alpineData) {
             alpineData.toolboxOpen = false;
+          }
+        }
+
+        if (window._forceEmptyCashierOnNextCajero) {
+          delete window._forceEmptyCashierOnNextCajero;
+          if (typeof ruiyiSuppressPosCartStorage === 'function') {
+            ruiyiSuppressPosCartStorage(3000, 'enter-cajero-after-table-checkout');
+          }
+          if (typeof cart !== 'undefined') {
+            cart = [];
+          }
+          window.cart = [];
+          window._currentViewingTable = null;
+          if (typeof ruiyiSetCartTableIdentity === 'function') {
+            ruiyiSetCartTableIdentity('', 'enter-cajero-after-table-checkout');
+          }
+          if (typeof renderCart === 'function') {
+            renderCart();
           }
         }
 
@@ -23431,8 +25240,12 @@ ${window.RUIYI_TRANS.createLayout}
       // 1. 从 localStorage 获取当前桌位状态和已保存的购物车 (和现在一样)
       const carritosGuardados = JSON.parse(localStorage.getItem('carritos_mesas') || '{}');
       const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
-      const estadoMesaLocal = mesasEstado[mesa] || null; // 单个已提交订单信息
-      const carritoLocal = carritosGuardados[mesa] || null; // 单个本地保存的购物车
+      const mesaGlobal = (typeof ruiyiSafeResolveGlobalTableNumber === 'function')
+        ? ruiyiSafeResolveGlobalTableNumber(mesa)
+        : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(mesa) : '');
+      const mesaKey = mesaGlobal && /^\d+$/.test(String(mesaGlobal)) ? `Mesa ${mesaGlobal}` : mesa;
+      const estadoMesaLocal = mesasEstado[mesaKey] || mesasEstado[mesa] || null; // 单个已提交订单信息
+      const carritoLocal = carritosGuardados[mesaKey] || carritosGuardados[mesa] || null; // 单个本地保存的购物车
 
       // 显示一个加载提示，因为我们要发起AJAX请求
       Swal.fire({
@@ -23450,6 +25263,7 @@ ${window.RUIYI_TRANS.createLayout}
           body: new URLSearchParams({
               action: 'ruiyi_pos_get_table_orders',
               table_number: mesa,
+              table_global_number: mesaGlobal || '',
               nonce: ajaxNonce // ajaxNonce 需要在全局或此作用域定义
           })
       })
@@ -23487,15 +25301,22 @@ ${window.RUIYI_TRANS.createLayout}
 
                   // 更新 localStorage 中的订单信息
                   const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
-                  if (!mesasEstado[mesa]) {
-                      mesasEstado[mesa] = {};
+                  if (!mesasEstado[mesaKey]) {
+                      mesasEstado[mesaKey] = {};
                   }
                   // 保存第一个订单的ID作为主要订单ID
-                  mesasEstado[mesa].orderId = backendOrders[0].order_number || backendOrders[0].id;
-                  mesasEstado[mesa].estado = 'ocupada';
-                  mesasEstado[mesa].total = totalAdeudadoBackend;
-                  mesasEstado[mesa].orderCount = backendOrders.length;
-                  mesasEstado[mesa].timestamp = new Date().toISOString();
+                  mesasEstado[mesaKey].orderId = backendOrders[0].order_number || backendOrders[0].id;
+                  mesasEstado[mesaKey].estado = 'ocupada';
+                  mesasEstado[mesaKey].total = totalAdeudadoBackend;
+                  mesasEstado[mesaKey].orderCount = backendOrders.length;
+                  mesasEstado[mesaKey].timestamp = new Date().toISOString();
+                  mesasEstado[mesaKey].table_number = mesa;
+                  mesasEstado[mesaKey].table_global_number = String(mesaGlobal || '');
+                  mesasEstado[mesaKey].canonical_table_key = mesaKey;
+                  mesasEstado[mesaKey].table_uid = mesaGlobal ? `table:${mesaGlobal}` : '';
+                  if (mesaKey !== mesa && mesasEstado[mesa]) {
+                      delete mesasEstado[mesa];
+                  }
                   localStorage.setItem('mesas_estado', JSON.stringify(mesasEstado));
               }
 
@@ -23637,15 +25458,78 @@ ${window.RUIYI_TRANS.createLayout}
       });
     }
 
+    function ruiyiNormalizeTableCheckoutOrderIds(mesa, orderIds, source = 'table_checkout') {
+        const rawIds = Array.isArray(orderIds) ? orderIds : (orderIds ? [orderIds] : []);
+        const normalizedIds = [];
+
+        rawIds.forEach(id => {
+            if (id === null || id === undefined || id === '') return;
+            const cleanId = String(id).replace(/[^0-9]/g, '');
+            if (cleanId && !normalizedIds.includes(cleanId)) {
+                normalizedIds.push(cleanId);
+            }
+        });
+
+        if (normalizedIds.length > 1) {
+            console.warn('[桌位结账] ⚠️ 同一桌位检测到多个活跃订单，这是异常数据。将兼容旧数据继续处理。', {
+                mesa,
+                source,
+                rawOrderIds: rawIds,
+                normalizedOrderIds: normalizedIds
+            });
+        }
+
+        try {
+            const tableOrderDataRaw = sessionStorage.getItem('tableOrderData');
+            const tableOrderData = tableOrderDataRaw ? JSON.parse(tableOrderDataRaw) : null;
+            const orders = Array.isArray(tableOrderData?.orders) ? tableOrderData.orders : [];
+            if (orders.length > 0) {
+                const targetTable = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+                    ? String(ruiyiSafeResolveGlobalTableNumber(mesa) || '')
+                    : String(mesa || '').replace(/^(餐桌|Mesa|Table)\s*/i, '');
+                const mismatchedOrders = orders.filter(order => {
+                    const orderId = String(order.id || order.order_number || '').replace(/[^0-9]/g, '');
+                    if (!normalizedIds.includes(orderId)) return false;
+                    const orderTable = order.table_number || order.tableNumber || order.table || '';
+                    if (!orderTable || !targetTable) return false;
+                    const resolvedOrderTable = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+                        ? String(ruiyiSafeResolveGlobalTableNumber(orderTable) || '')
+                        : String(orderTable || '').replace(/^(餐桌|Mesa|Table)\s*/i, '');
+                    return resolvedOrderTable && resolvedOrderTable !== targetTable;
+                });
+
+                if (mismatchedOrders.length > 0) {
+                    console.warn('[桌位结账] ⚠️ orderIds 中存在不属于当前桌位的订单，继续交给后端严格校验。', {
+                        mesa,
+                        source,
+                        targetTable,
+                        mismatchedOrders
+                    });
+                }
+            }
+        } catch (error) {
+            console.warn('[桌位结账] 检查 orderIds 桌位归属失败:', source, error);
+        }
+
+        return normalizedIds;
+    }
+    window.ruiyiNormalizeTableCheckoutOrderIds = ruiyiNormalizeTableCheckoutOrderIds;
+
     // Nueva función para manejar el pago completo de la mesa (PASO 3)
     // Esta función se refinará en el siguiente paso.
-    function procesarPagoCompletoDeMesa(mesa, totalAdeudado, orderIds, cartSnapshot = null) {
-    // 🔥 cartSnapshot: 可选参数，用于离线结账时传入购物车数据（因为购物车可能已被清空）
+	    function procesarPagoCompletoDeMesa(mesa, totalAdeudado, orderIds, cartSnapshot = null) {
+	    // 🔥 cartSnapshot: 可选参数，用于离线结账时传入购物车数据（因为购物车可能已被清空）
+	    if (typeof ruiyiResetSwalLoadingState === 'function') {
+	        ruiyiResetSwalLoadingState('before-table-checkout-modal');
+	    }
 
-    // 获取ajaxUrl和nonce
+	    // 获取ajaxUrl和nonce
     var ajaxUrl = window.ajaxUrl || '<?php echo esc_url(admin_url('admin-ajax.php')); ?>';
     var ajaxNonce = window.RUIYI_POS?.nonce;
     const ruiyi_pos_nonce = ajaxNonce;
+    orderIds = typeof ruiyiNormalizeTableCheckoutOrderIds === 'function'
+        ? ruiyiNormalizeTableCheckoutOrderIds(mesa, orderIds, 'procesarPagoCompletoDeMesa')
+        : (Array.isArray(orderIds) ? orderIds : (orderIds ? [orderIds] : []));
 
         // 存储用户信息的变量
         let verifiedUser = null;
@@ -23934,9 +25818,13 @@ ${window.RUIYI_TRANS.createLayout}
             confirmButtonColor: '#4caf50',
             showCancelButton: true,
             cancelButtonText: '<?php echo ruiyi_translate('Cancelar', 'Cancel', '取消'); ?>',
-            width: ruiyiIsCheckoutTouchKeypadEnabled() ? '780px' : '500px',
-            didOpen: () => {
-                ruiyiAttachCheckoutTouchKeypad(Swal.getPopup());
+	            width: ruiyiIsCheckoutTouchKeypadEnabled() ? '780px' : '500px',
+	            didOpen: () => {
+	                if (typeof ruiyiResetSwalLoadingState === 'function') {
+	                    ruiyiResetSwalLoadingState('table-checkout-modal-didOpen');
+	                    setTimeout(() => ruiyiResetSwalLoadingState('table-checkout-modal-didOpen-late'), 0);
+	                }
+	                ruiyiAttachCheckoutTouchKeypad(Swal.getPopup());
 
                 // 初始化价格状态跟踪
                 let currentOriginalTotal = totalAdeudado;
@@ -24993,7 +26881,7 @@ ${window.RUIYI_TRANS.createLayout}
                     renderizarMesas('payment-popup-closed');
                 }
             },
-            preConfirm: async () => {
+            preConfirm: () => {
                 // 查找选中的支付方式按钮（支持多种颜色状态）
                 const selectedPaymentBtn = Swal.getPopup().querySelector('.payment-method-btn-mesa.border-green-500') ||
                                           Swal.getPopup().querySelector('.payment-method-btn-mesa.border-blue-500') ||
@@ -25054,28 +26942,32 @@ ${window.RUIYI_TRANS.createLayout}
                     // 🔥 如果有客户电话号码，检查是否存在，不存在则创建
                     // 🔥 修复：使用 customerInfo.phone 而不是表单变量 customerPhone
                     if (customerInfo.phone) {
-                        try {
-                            // 1. 先检查客户是否已存在
-                            const checkResponse = await fetch(window.ajaxUrl || '<?php echo admin_url('admin-ajax.php'); ?>', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                                body: new URLSearchParams({
-                                    action: 'ruiyi_find_customer_by_phone',
-                                    phone: customerInfo.phone,  // 🔥 修复：使用 customerInfo.phone
-                                    nonce: window.RUIYI_POS?.nonce || posNonce
-                                })
-                            });
+                        // 不阻塞支付确认。这里如果等待网络，SweetAlert 会隐藏“完成支付”按钮并显示 loading；
+                        // 在网络慢或接口卡住时，收银员会看到支付弹窗一直转圈。
+                        (async () => {
+                            try {
+                                // 1. 先检查客户是否已存在
+                                const checkResponse = await fetch(window.ajaxUrl || '<?php echo admin_url('admin-ajax.php'); ?>', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                    body: new URLSearchParams({
+                                        action: 'ruiyi_find_customer_by_phone',
+                                        phone: customerInfo.phone,  // 🔥 修复：使用 customerInfo.phone
+                                        nonce: window.RUIYI_POS?.nonce || posNonce
+                                    })
+                                });
 
-                            const checkData = await checkResponse.json();
+                                const checkData = await checkResponse.json();
 
-                            // 2. 如果客户不存在，创建新客户
-                            if (!checkData.success || !checkData.data || !checkData.data.customer) {
-                                const saveResult = await createCustomerInfoRecord(customerInfo);
-                                // 创建客户失败也继续支付
+                                // 2. 如果客户不存在，创建新客户
+                                if (!checkData.success || !checkData.data || !checkData.data.customer) {
+                                    await createCustomerInfoRecord(customerInfo);
+                                    // 创建客户失败也继续支付
+                                }
+                            } catch (error) {
+                                // 检查/创建客户失败静默处理，继续支付
                             }
-                        } catch (error) {
-                            // 检查/创建客户失败静默处理，继续支付
-                        }
+                        })();
                     }
                 }
 
@@ -25181,6 +27073,7 @@ ${window.RUIYI_TRANS.createLayout}
             confirmButtonText: '<?php echo ruiyi_translate("Completar Pago", "Complete Payment", "完成支付"); ?>',
             cancelButtonText: '<?php echo ruiyi_translate("Cancelar", "Cancel", "取消"); ?>',
             confirmButtonColor: '#059669',
+            showLoaderOnConfirm: false,
             width: window.innerWidth < 768 ? '95%' : (ruiyiIsCheckoutTouchKeypadEnabled() ? '860px' : '600px'),
             customClass: {
                 popup: 'payment-modal-responsive' + (ruiyiIsCheckoutTouchKeypadEnabled() ? ' checkout-touch-popup' : ''),
@@ -25225,7 +27118,19 @@ ${window.RUIYI_TRANS.createLayout}
 
             // 🔥 关键修复：将 cartSnapshot 添加到 paymentDetails 中传递给 finalizarMultiplesPedidos
             paymentDetails.cartSnapshot = cartSnapshot;
-            finalizarMultiplesPedidos(mesa, orderIds, paymentDetails.paymentMethod, paymentDetails);
+            try {
+                finalizarMultiplesPedidos(mesa, orderIds, paymentDetails.paymentMethod, paymentDetails);
+            } catch (paymentStartError) {
+                console.error('[桌位结账] 启动支付请求失败:', paymentStartError);
+                if (typeof Swal !== 'undefined') {
+                    Swal.fire({
+                        icon: 'error',
+                        title: '<?php echo ruiyi_translate("Pago no confirmado", "Payment not confirmed", "结账未确认"); ?>',
+                        text: paymentStartError.message || '<?php echo ruiyi_translate("No se pudo iniciar el pago. Inténtelo de nuevo.", "Could not start payment. Please try again.", "无法启动支付，请重试。"); ?>',
+                        confirmButtonColor: '#f44336'
+                    });
+                }
+            }
         }
     });
     }
@@ -25238,6 +27143,10 @@ ${window.RUIYI_TRANS.createLayout}
     let originalTotalAmount = 0;
 
     function finalizarMultiplesPedidos(mesa, orderIds, metodoPago, paymentDetails) {
+        orderIds = typeof ruiyiNormalizeTableCheckoutOrderIds === 'function'
+          ? ruiyiNormalizeTableCheckoutOrderIds(mesa, orderIds, 'finalizarMultiplesPedidos')
+          : (Array.isArray(orderIds) ? orderIds : (orderIds ? [orderIds] : []));
+
         // 🔥 关键修复：从 paymentDetails 中获取 cartSnapshot
         // 这解决了 crearPedidoMesa 清空购物车后，离线结账无法获取商品数据的问题
         let localCartSnapshot;
@@ -25414,9 +27323,16 @@ ${window.RUIYI_TRANS.createLayout}
             addPendingPaymentOrderIds(processedOrderIdsInstant, mesa);
           }
 
-          // 3. 立即清理本地状态
-          cart = [];
-          renderCart();
+          // 3. 立即清理本地状态，并禁止快速结账缓存恢复刚结账桌位的商品
+          if (typeof ruiyiClearCashierCartAfterTableCheckout === 'function') {
+            ruiyiClearCashierCartAfterTableCheckout(mesa, 'instant_table_checkout');
+          } else {
+            cart = [];
+            window.cart = [];
+            if (typeof renderCart === 'function') renderCart();
+            if (typeof clearPosCartStorage === 'function') clearPosCartStorage();
+            window._currentViewingTable = null;
+          }
           resetAllPaymentStates('instant_checkout');
 
           const tableNumberInputInstant = document.getElementById('table-number');
@@ -25560,7 +27476,7 @@ ${window.RUIYI_TRANS.createLayout}
         // 🔥 备用模式：如果PaymentQueue不可用或离线，使用原始流程
         if (isOnline) {
           Swal.fire({
-              title: '<?php echo ruiyi_translate("Procesando pago de múltiples pedidos...", "Processing payment for multiple orders...", "正在处理多个订单的支付..."); ?>',
+              title: '<?php echo ruiyi_translate("Procesando pago de mesa...", "Processing table payment...", "正在处理桌位支付..."); ?>',
               text: '<?php echo ruiyi_translate("Por favor espere.", "Please wait.", "请稍候。"); ?>',
               allowOutsideClick: false,
               didOpen: () => { Swal.showLoading(); }
@@ -25598,6 +27514,12 @@ ${window.RUIYI_TRANS.createLayout}
             order_ids: JSON.stringify(processedOrderIds),
             payment_method: metodoPago,
             table_number: mesa,
+            table_global_number: typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+                ? String(ruiyiSafeResolveGlobalTableNumber(mesa) || '').replace(/\D/g, '')
+                : String(mesa || '').replace(/\D/g, ''),
+            table_display_name: typeof ruiyiResolveTableDisplayName === 'function'
+                ? ruiyiResolveTableDisplayName(mesa, mesa)
+                : mesa,
             order_type: currentOrderType,
             total_amount: totalAmount,
             nonce: ajaxNonce
@@ -25656,13 +27578,7 @@ ${window.RUIYI_TRANS.createLayout}
 
         // 🔥 PWA: Handle offline payment completion
         if (!isOnline) {
-          Swal.fire({
-            icon: 'warning',
-            title: '<?php echo ruiyi_translate("Conexión requerida", "Connection required", "需要联网确认"); ?>',
-            text: '<?php echo ruiyi_translate("Para cerrar una mesa, el servidor debe confirmar el pago. Revise la red e inténtelo de nuevo.", "To close a table, the server must confirm the payment. Check the network and try again.", "桌位结账必须等服务器确认完成。请恢复网络后重试。"); ?>',
-            confirmButtonColor: '#f59e0b'
-          });
-          return;
+          console.warn('[PWA] 离线桌位结账：保存到离线队列，恢复网络后同步到服务器');
           
           // Calculate discount amount from discount percent
           // 🔥 【关键修复】正确计算折扣金额
@@ -25817,9 +27733,15 @@ ${window.RUIYI_TRANS.createLayout}
             window._paymentJustCompleted = true;
             setTimeout(() => { window._paymentJustCompleted = false; }, 3000);
 
-            // Clear cart and reset UI
-            syncCart([]);
-            if (typeof renderCart === 'function') renderCart();
+            // Clear cart and reset UI; prevent completed table items from being restored in quick checkout mode
+            if (typeof ruiyiClearCashierCartAfterTableCheckout === 'function') {
+              ruiyiClearCashierCartAfterTableCheckout(mesa, 'offline_table_checkout');
+            } else {
+              syncCart([]);
+              if (typeof renderCart === 'function') renderCart();
+              if (typeof clearPosCartStorage === 'function') clearPosCartStorage();
+              window._currentViewingTable = null;
+            }
             resetAllPaymentStates('multiple_order_complete');
 
             const tableNumberInput = document.getElementById('table-number');
@@ -25838,6 +27760,12 @@ ${window.RUIYI_TRANS.createLayout}
             window._skipAutoSaveInCambiarSeccion = true;
             if (typeof cambiarSeccion === 'function') {
               cambiarSeccion('mesas');
+            }
+
+            if (typeof ruiyiOpenDrawerAfterPayment === 'function') {
+              ruiyiOpenDrawerAfterPayment(metodoPago, 'offline_table_checkout').catch(err => {
+                console.warn('[PWA] 离线桌位结账开钱箱失败:', err);
+              });
             }
 
             // 5. 显示简短的成功提示（toast风格，不阻塞）
@@ -25914,9 +27842,6 @@ ${window.RUIYI_TRANS.createLayout}
                 // 🔥 关闭加载弹窗
                 Swal.close();
 
-                // 🔥 Display purchase success message on VFD
-                displayVFDSuccessMessage();
-
                 // 🔥 保存上一单信息（在清空购物车前）
                 // 获取桌位显示名称
                 let tableDisplayNameBackup = `Mesa ${mesa}`;
@@ -25931,7 +27856,7 @@ ${window.RUIYI_TRANS.createLayout}
                 // 🔥 【重要】桌位结账中 totalAmount 已经是扣除抵扣券后的金额
                 // 不需要再次扣除抵扣券！
                 const chequeAmountTableBackup = paymentDetails.chequeRestauranteAmount || 0;
-                saveAndShowLastOrderInfo({
+                const tableCheckoutCompletionInfo = {
                     totalAmount: totalAmount, // 🔥 桌位结账：totalAmount 已是实付金额（扣除抵扣券后）
                     originalTotal: paymentDetails.originalTotalAmount || (totalAmount + chequeAmountTableBackup), // 🔥 原价（抵扣前）
                     discountAmount: paymentDetails.discountAmount || 0, // 🔥 折扣金额
@@ -25943,15 +27868,21 @@ ${window.RUIYI_TRANS.createLayout}
                     cardAmount: paymentDetails.cardAmount || 0,
                     tableNumber: tableDisplayNameBackup,
                     orderType: 'table'
-                });
+                };
 
                 // 🔥🔥🔥 【2026-01-22 关键修复】设置支付完成标志
                 window._paymentJustCompleted = true;
                 setTimeout(() => { window._paymentJustCompleted = false; }, 3000);
 
-                // 清空购物车
-                syncCart([]);
-                if (typeof renderCart === 'function') renderCart();
+                // 清空购物车，并禁止快速结账缓存恢复刚结账桌位的商品
+                if (typeof ruiyiClearCashierCartAfterTableCheckout === 'function') {
+                    ruiyiClearCashierCartAfterTableCheckout(mesa, 'table_checkout_confirmed');
+                } else {
+                    syncCart([]);
+                    if (typeof renderCart === 'function') renderCart();
+                    if (typeof clearPosCartStorage === 'function') clearPosCartStorage();
+                    window._currentViewingTable = null;
+                }
 
                 // 🔥 隐藏查看模式相关按钮和工具箱
                 const viewModeButtons = ['checkout-table-btn', 'toolbox-toggle-btn'];
@@ -26022,12 +27953,33 @@ ${window.RUIYI_TRANS.createLayout}
                 // 释放桌位状态 - 确保桌位被标记为可用
                 releaseTableOnOrderComplete(mesa);
 
-                // 在打印小票前，重新计算订单产品的税率
+                // 服务器确认完成后立即返回桌位模块；小票生成/打印在后台继续，不阻塞收银员操作。
+                if (typeof exitViewMode === 'function') {
+                    exitViewMode();
+                }
+                window._skipAutoSaveInCambiarSeccion = true;
+                if (typeof cambiarSeccion === 'function') {
+                    cambiarSeccion('mesas');
+                } else {
+                    const mesasLink = document.querySelector('a[href="#mesas"]');
+                    if (mesasLink) {
+                        mesasLink.click();
+                    }
+                }
+                if (typeof renderizarMesas === 'function') {
+                    renderizarMesas('payment-processed');
+                }
+                if (typeof ruiyiRunTableCheckoutCompletionUi === 'function') {
+                    ruiyiRunTableCheckoutCompletionUi(metodoPago, tableCheckoutCompletionInfo, 'table_checkout_returned');
+                }
+
+                // 在后台重新计算税率并生成/打印结账小票，不影响返回桌位模块和开钱箱。
 
                 // 🔥 关键修复：如果有合并订单ID，使用它；否则使用原始订单IDs
                 const orderIdsForReceipt = responseData.merged_order_id
                     ? [responseData.merged_order_id]
                     : processedOrderIds;
+                let tableReceiptRequestBody = '';
 
                 // 获取订单产品的分类税率
                 const recalculateTaxRatesFormData = new URLSearchParams();
@@ -26138,6 +28090,8 @@ ${window.RUIYI_TRANS.createLayout}
                         printTicketFormData.append('cheque_restaurante_amount', paymentDetails.chequeRestauranteAmount);
                     }
 
+                    tableReceiptRequestBody = printTicketFormData.toString();
+
                     return fetch(ajaxUrl, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -26156,7 +28110,7 @@ ${window.RUIYI_TRANS.createLayout}
                       localStorage.setItem('lastReceiptHtml', receiptData.data.html);
                       localStorage.setItem('lastReceiptType', 'table_payment');
                       localStorage.setItem('lastReceiptTimestamp', Date.now());
-                      localStorage.setItem('lastReceiptRequestBody', printTicketFormData.toString());
+                      localStorage.setItem('lastReceiptRequestBody', tableReceiptRequestBody);
 
                         // 🖨️ 检查悬浮开关是否启用自动打印（后台开关 + 收银员开关）
                         if (_autoPrintEnabled) {
@@ -26166,84 +28120,34 @@ ${window.RUIYI_TRANS.createLayout}
                             }
                         }
 
-                        // 🔥 打开钱箱 - 堂食结账完成后
-                        // 根据设置决定刷卡支付是否打开钱箱
-                        const openDrawerOnCardTable = window.clodopConfig?.openDrawerOnCard || false;
-                        const shouldOpenDrawerTable = metodoPago === 'cash' || metodoPago === 'mixed' || (metodoPago === 'card' && openDrawerOnCardTable);
-
-                        if (shouldOpenDrawerTable) {
-                            if (typeof abrirCajonDinero === 'function') {
-                                abrirCajonDinero().catch(error => {
-                                    // 自动开钱箱失败静默处理
-                                });
-                            }
-                        } else {
-                        }
-
                     } else {
-                        // 🔥 使用用户友好的打印机配置提示
-                        showPrinterConfigDialog();
+                        console.warn('[堂食结账] 小票HTML生成失败，但结账已完成:', receiptData);
+                        Toastify({
+                            text: '<?php echo ruiyi_translate("Pago completado. No se pudo generar el ticket.", "Payment completed. Receipt could not be generated.", "结账已完成，但小票生成失败"); ?>',
+                            duration: 2500,
+                            gravity: 'top',
+                            position: 'center',
+                            style: { background: '#f59e0b' }
+                        }).showToast();
                     }
 
-                    // 🔥 打印完成后返回桌位模块并切换到外卖模式
-                    // 🔥 桌位结账后始终返回桌位模块
-                    setTimeout(() => {
-                        // 先退出查看模式，切换到外卖模式
-                        if (typeof exitViewMode === 'function') {
-                            exitViewMode();
-                        }
-                        // 🔥🔥🔥 【2026-01-22 关键修复】设置跳过标志，防止 cambiarSeccion 触发重复的 autoSaveTableOrder
-                        window._skipAutoSaveInCambiarSeccion = true;
-                        // 🔥 始终跳转到桌位模块（桌位结账后）
-                        if (typeof cambiarSeccion === 'function') {
-                            cambiarSeccion('mesas');
-                        } else {
-                            // 备用方案：直接点击桌位导航
-                            const mesasLink = document.querySelector('a[href="#mesas"]');
-                            if (mesasLink) {
-                                mesasLink.click();
-                            }
-                        }
-
-                        // 🔥 显示成功提示（toast风格，不阻塞）
-                        if (typeof Swal !== 'undefined') {
-                            Swal.fire({
-                                icon: 'success',
-                                title: '<?php echo ruiyi_translate('Pago completado', 'Payment completed', '支付完成'); ?>',
-                                timer: 2000,
-                                showConfirmButton: false,
-                                position: 'top-end',
-                                toast: true
-                            });
-                        }
-                    }, 500); // 短暂延迟以确保打印任务已发送
+                    console.log('[堂食结账] 小票后台生成完成');
                 })
                 .catch(error => {
                     console.error('🔍 [税率调试] 税率获取或小票生成错误:', error);
-                    // 🔥 使用用户友好的打印机配置提示
-                    showPrinterConfigDialog();
+                    Toastify({
+                        text: '<?php echo ruiyi_translate("Pago completado. Revise la impresión del ticket.", "Payment completed. Please check receipt printing.", "结账已完成，请检查小票打印"); ?>',
+                        duration: 2500,
+                        gravity: 'top',
+                        position: 'center',
+                        style: { background: '#f59e0b' }
+                    }).showToast();
 
-                    // 🔥 即使打印失败，也返回桌位模块
-                    setTimeout(() => {
-                        // 先退出查看模式，切换到外卖模式
-                        if (typeof exitViewMode === 'function') {
-                            exitViewMode();
-                        }
-                        // 🔥🔥🔥 【2026-01-22 关键修复】设置跳过标志，防止 cambiarSeccion 触发重复的 autoSaveTableOrder
-                        window._skipAutoSaveInCambiarSeccion = true;
-                        // 🔥 始终跳转到桌位模块（桌位结账后）
-                        if (typeof cambiarSeccion === 'function') {
-                            cambiarSeccion('mesas');
-                        } else {
-                            const mesasLink = document.querySelector('a[href="#mesas"]');
-                            if (mesasLink) {
-                                mesasLink.click();
-                            }
-                        }
-                    }, 500);
+                    if (typeof ruiyiCleanupPostCheckoutUiState === 'function') {
+                        ruiyiCleanupPostCheckoutUiState('table-checkout-background-print-error');
+                        setTimeout(() => ruiyiCleanupPostCheckoutUiState('table-checkout-background-print-error-late'), 800);
+                    }
                 });
-
-                renderizarMesas('payment-processed'); // Actualizar UI de mesas
                 
             } else {
                 const errorMsg = (data.data && data.data.message) ? data.data.message :
@@ -26253,7 +28157,7 @@ ${window.RUIYI_TRANS.createLayout}
         })
         .catch(error => {
             clearTimeout(paymentTimeoutId);  // 🔥 清除超时定时器
-            console.error('Error al finalizar múltiples pedidos:', error);
+            console.error('[桌位结账] Error al finalizar pago de mesa:', error);
             window._paymentJustCompleted = false;
             Swal.fire({
                 icon: 'error',
@@ -26361,9 +28265,15 @@ ${window.RUIYI_TRANS.createLayout}
               window._paymentJustCompleted = true;
               setTimeout(() => { window._paymentJustCompleted = false; }, 3000);
 
-              // Clear cart and reset UI
-              syncCart([]);
-              if (typeof renderCart === 'function') renderCart();
+              // Clear cart and reset UI; prevent completed table items from being restored in quick checkout mode
+              if (typeof ruiyiClearCashierCartAfterTableCheckout === 'function') {
+                ruiyiClearCashierCartAfterTableCheckout(mesa, 'network_fallback_table_checkout');
+              } else {
+                syncCart([]);
+                if (typeof renderCart === 'function') renderCart();
+                if (typeof clearPosCartStorage === 'function') clearPosCartStorage();
+                window._currentViewingTable = null;
+              }
               resetAllPaymentStates('multiple_order_complete');
 
               const tableNumberInput = document.getElementById('table-number');
@@ -26384,17 +28294,17 @@ ${window.RUIYI_TRANS.createLayout}
                 cambiarSeccion('mesas');
               }
 
-              // 5. 显示简短的成功提示（toast风格，不阻塞）
-              if (typeof Swal !== 'undefined') {
-                Swal.fire({
-                  icon: 'success',
-                  title: '<?php echo ruiyi_translate('Guardado', 'Saved', '已保存'); ?>',
+              // 5. 显示简短的成功提示（Toastify 不会截获键盘事件）
+              if (typeof ruiyiShowPostCheckoutToast === 'function') {
+                ruiyiShowPostCheckoutToast('<?php echo ruiyi_translate('Pago guardado offline', 'Payment saved offline', '离线支付已保存'); ?>');
+              } else if (typeof Toastify === 'function') {
+                Toastify({
                   text: '<?php echo ruiyi_translate('Pago guardado offline', 'Payment saved offline', '离线支付已保存'); ?>',
-                  timer: 1500,
-                  showConfirmButton: false,
-                  position: 'top-end',
-                  toast: true
-                });
+                  duration: 2000,
+                  gravity: 'top',
+                  position: 'right',
+                  style: { background: '#10b981' }
+                }).showToast();
               }
 
               // 6. Refresh pending orders list
@@ -26721,20 +28631,26 @@ ${window.RUIYI_TRANS.createLayout}
     }
 
     // 释放餐桌
-    function liberarMesa(mesa) {
-      // 检查餐桌状态
-      const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
-      const carritosGuardados = JSON.parse(localStorage.getItem('carritos_mesas') || '{}');
-      
-      let mensaje = '';
-      let iconoTipo = 'warning';
-      
-      // 根据餐桌状态显示不同的提示
-      if (mesasEstado[mesa] && mesasEstado[mesa].estado === 'ocupada') {
-        // 有活跃订单
-        mensaje = `<?php echo ruiyi_translate("Esta mesa está ocupada con la orden","This table is occupied with the order","此桌位被订单占用"); ?> #${mesasEstado[mesa].orderId || 'N/A'}. <?php echo ruiyi_translate("¿Está seguro que desea liberarla?","Are you sure you want to free it?","您确定要释放它吗？"); ?> <?php echo ruiyi_translate("Esta acción liberará la mesa y cancelará automáticamente la orden asociada en el sistema.","This action will free the table and automatically cancel the associated order in the system.","此操作将释放餐桌并自动取消系统中的关联订单。"); ?>`;
-        iconoTipo = 'warning';
-      } else if (carritosGuardados[mesa]) {
+	    function liberarMesa(mesa) {
+	      // 检查餐桌状态
+	      const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
+	      const carritosGuardados = JSON.parse(localStorage.getItem('carritos_mesas') || '{}');
+	      const mesaGlobal = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+	        ? ruiyiSafeResolveGlobalTableNumber(mesa)
+	        : resolveGlobalTableNumber(mesa);
+	      const mesaKey = mesaGlobal ? `Mesa ${mesaGlobal}` : mesa;
+	      const mesaState = mesasEstado[mesaKey] || mesasEstado[mesa];
+	      const mesaCart = carritosGuardados[mesaKey] || carritosGuardados[mesa];
+	      
+	      let mensaje = '';
+	      let iconoTipo = 'warning';
+	      
+	      // 根据餐桌状态显示不同的提示
+	      if (mesaState && mesaState.estado === 'ocupada') {
+	        // 有活跃订单
+	        mensaje = `<?php echo ruiyi_translate("Esta mesa está ocupada con la orden","This table is occupied with the order","此桌位被订单占用"); ?> #${mesaState.orderId || 'N/A'}. <?php echo ruiyi_translate("¿Está seguro que desea liberarla?","Are you sure you want to free it?","您确定要释放它吗？"); ?> <?php echo ruiyi_translate("Esta acción liberará la mesa y cancelará automáticamente la orden asociada en el sistema.","This action will free the table and automatically cancel the associated order in the system.","此操作将释放餐桌并自动取消系统中的关联订单。"); ?>`;
+	        iconoTipo = 'warning';
+	      } else if (mesaCart) {
         // 有保存的购物车
         mensaje = `<?php echo ruiyi_translate("¿Está seguro que desea liberar","Are you sure you want to free","您确定要释放"); ?> ${mesa}? <?php echo ruiyi_translate("Se eliminará el pedido guardado y no podrá recuperarse.","The saved order will be deleted and cannot be recovered.","已保存的订单将被删除，无法恢复。"); ?>`;
         iconoTipo = 'warning';
@@ -26762,11 +28678,12 @@ ${window.RUIYI_TRANS.createLayout}
       }).then((result) => {
         if (result.isConfirmed) {
           // 如果餐桌有关联的订单，取消该桌位的所有订单
-          if (mesasEstado[mesa] && mesasEstado[mesa].orderId) {
+          if (mesaState && mesaState.orderId) {
             // 调用取消桌位所有订单的AJAX请求
             const formData = new FormData();
             formData.append('action', 'ruiyi_pos_cancel_table_orders');
             formData.append('table_number', mesa);
+            formData.append('table_global_number', mesaGlobal || '');
             formData.append('nonce', ajaxNonce);
             
             fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
@@ -26836,21 +28753,36 @@ ${window.RUIYI_TRANS.createLayout}
     }
 
     // 最终释放餐桌的函数（在取消订单之后调用）
-    function liberarMesaFinal(mesa, mesasEstado, carritosGuardados) {
-      // 更新餐桌状态为空闲，而不是删除
-      mesasEstado[mesa] = {
-        estado: 'libre',
-        orderId: null,
-        total: 0,
-        timestamp: new Date().toISOString()
-      };
-      localStorage.setItem('mesas_estado', JSON.stringify(mesasEstado));
+	    function liberarMesaFinal(mesa, mesasEstado, carritosGuardados) {
+	      const mesaGlobal = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+	        ? ruiyiSafeResolveGlobalTableNumber(mesa)
+	        : resolveGlobalTableNumber(mesa);
+	      const mesaKey = mesaGlobal ? `Mesa ${mesaGlobal}` : mesa;
+	      // 更新餐桌状态为空闲，而不是删除
+	      mesasEstado[mesaKey] = {
+	        estado: 'libre',
+	        orderId: null,
+	        total: 0,
+	        timestamp: new Date().toISOString(),
+	        table_number: mesa,
+	        table_global_number: String(mesaGlobal || ''),
+	        canonical_table_key: mesaKey,
+	        table_uid: mesaGlobal ? `table:${mesaGlobal}` : ''
+	      };
+	      if (mesaKey !== mesa && mesasEstado[mesa]) {
+	        delete mesasEstado[mesa];
+	      }
+	      localStorage.setItem('mesas_estado', JSON.stringify(mesasEstado));
 
-      // 清除购物车数据
-      if (carritosGuardados[mesa]) {
-        delete carritosGuardados[mesa];
-        localStorage.setItem('carritos_mesas', JSON.stringify(carritosGuardados));
-      }
+	      // 清除购物车数据
+	      if (carritosGuardados[mesaKey]) {
+	        delete carritosGuardados[mesaKey];
+	        localStorage.setItem('carritos_mesas', JSON.stringify(carritosGuardados));
+	      }
+	      if (mesaKey !== mesa && carritosGuardados[mesa]) {
+	        delete carritosGuardados[mesa];
+	        localStorage.setItem('carritos_mesas', JSON.stringify(carritosGuardados));
+	      }
 
       // 🔴 重要：如果当前收银页面正在查看该桌位，清理收银页面状态
       const currentViewMode = typeof ruiyiGetActiveTableViewMode === 'function'
@@ -26940,7 +28872,7 @@ ${window.RUIYI_TRANS.createLayout}
       }
 
       // 发送服务器更新请求，确保服务器端也标记为空闲
-      const tableNumber = mesa.replace(tablePrefix + ' ', '');
+	      const tableNumber = mesaGlobal || mesa.replace(tablePrefix + ' ', '');
       const formData = new URLSearchParams();
       formData.append('action', 'update_table_status');
       formData.append('table_id', tableNumber);
@@ -27106,7 +29038,9 @@ ${window.RUIYI_TRANS.createLayout}
 
       // 清理之前的查看模式（如果存在）
       sessionStorage.removeItem('tableViewMode');
+      sessionStorage.removeItem('isViewMode');
       sessionStorage.removeItem('tableOrderData');
+      sessionStorage.removeItem('tableViewOrderData');
 
       // 更新订单类型按钮状态（恢复外卖选项）
       setTimeout(() => {
@@ -27121,15 +29055,25 @@ ${window.RUIYI_TRANS.createLayout}
       // 先设置桌位号，然后强制更新按钮状态
       // 🔥🔥🔥 【2026-04-06 关键修复】使用解析后的全局编号，防止自定义名"T16"等写入输入框
       // 导致下游 quickSaveTableOrder/syncTableOrderToServer 发送错误的 table_number
-      const resolvedSelection = (typeof resolveGlobalTableNumber === 'function')
-        ? resolveGlobalTableNumber(mesaSeleccionada)
-        : mesaSeleccionada;
-      const tableNumberInput = document.getElementById('table-number');
-      if (tableNumberInput) {
-        tableNumberInput.value = resolvedSelection;
-        // 🔥 更新购物车上方的桌位号显示（仍用原始名，保留自定义显示）
-        updateCurrentTableDisplay(mesaSeleccionada);
-      }
+	      const resolvedSelection = (typeof resolveGlobalTableNumber === 'function')
+	        ? resolveGlobalTableNumber(mesaSeleccionada)
+	        : mesaSeleccionada;
+	      const displaySelection = typeof ruiyiResolveTableDisplayName === 'function'
+	        ? ruiyiResolveTableDisplayName(mesaSeleccionada, mesaSeleccionada)
+	        : mesaSeleccionada;
+	      window._currentViewingTable = resolvedSelection || null;
+	      if (typeof ruiyiSetCartTableIdentity === 'function') {
+	        ruiyiSetCartTableIdentity(resolvedSelection || mesaSeleccionada, 'handleTableSelectionConfirmed');
+	      }
+	      const tableNumberInput = document.getElementById('table-number');
+	      if (tableNumberInput) {
+	        tableNumberInput.value = displaySelection || resolvedSelection;
+	        // 🔥 更新购物车上方的桌位号显示（仍用原始名，保留自定义显示）
+	        updateCurrentTableDisplay(displaySelection || mesaSeleccionada);
+	      }
+	      if (typeof ruiyiResolveCurrentTableUiContext === 'function') {
+	        ruiyiResolveCurrentTableUiContext('handleTableSelectionConfirmed');
+	      }
 
       // 🔥 新增：强制设置为堂食模式并更新UI
       sessionStorage.setItem('tipoPedidoSeleccionado', 'servir');
@@ -27195,6 +29139,7 @@ ${window.RUIYI_TRANS.createLayout}
           } else {
             // 清空购物车开始新订单
             cart = [];
+            window.cart = cart;
             renderCart();
             // 重置所有折扣和支付状态
             resetAllPaymentStates('new_table_order');
@@ -27233,6 +29178,7 @@ ${window.RUIYI_TRANS.createLayout}
       } else {
         // 直接切换到收银页面，清空购物车开始新订单
         cart = [];
+        window.cart = cart;
         renderCart();
         // 重置所有折扣和支付状态
         resetAllPaymentStates('direct_table_switch');
@@ -27270,12 +29216,16 @@ ${window.RUIYI_TRANS.createLayout}
       }
 
       // 查找完整的桌位名称（包含分类信息）
-      let displayName = tableNumber;
+      let displayName = typeof ruiyiResolveTableDisplayName === 'function'
+        ? ruiyiResolveTableDisplayName(tableNumber, tableNumber)
+        : tableNumber;
 
       // 尝试从桌位映射中获取完整的分类显示名称
-      if (window.tableCategoryMappings) {
-        // 提取数字部分
-        const tableNum = parseInt(tableNumber.match(/\d+/)?.[0]);
+      if (window.tableCategoryMappings && displayName === tableNumber) {
+        const resolvedTableNum = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+          ? ruiyiSafeResolveGlobalTableNumber(tableNumber)
+          : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(tableNumber) : '');
+        const tableNum = /^\d+$/.test(String(resolvedTableNum || '')) ? parseInt(resolvedTableNum, 10) : NaN;
 
         if (!isNaN(tableNum)) {
           // tableCategoryMappings 可能是对象或数组
@@ -27298,7 +29248,7 @@ ${window.RUIYI_TRANS.createLayout}
       displayDiv.classList.remove('hidden');
 
       // 🔥 更新 delivery 客户信息显示
-      updateDeliveryCustomerInfoDisplay(tableNumber);
+      updateDeliveryCustomerInfoDisplay(displayName || tableNumber);
 
       // 🔥 根据桌位分区更新产品卡片显示价格
       updateAllProductCardPrices();
@@ -27444,11 +29394,50 @@ ${window.RUIYI_TRANS.createLayout}
     }
 
     /**
+     * 保存桌位订单后只清理桌位上下文，不清除订单备注/打印状态。
+     * 防止已保存桌位的 table-number 残留，在进入其他分区桌位时被自动保存误判为空购物车清台。
+     */
+    function ruiyiClearSavedTableOrderContext(reason = '') {
+      window._currentViewingTable = null;
+      if (typeof ruiyiSetCartTableIdentity === 'function') {
+        ruiyiSetCartTableIdentity('', reason || 'saved-table-order-context-cleared');
+      }
+
+      const tableInput = document.getElementById('table-number');
+      if (tableInput) {
+        tableInput.value = '';
+      }
+
+      if (typeof updateCurrentTableDisplay === 'function') {
+        updateCurrentTableDisplay('');
+      }
+
+      cart = [];
+      window.cart = cart;
+      window.cartModified = false;
+      selectedCartItemIndex = null;
+      window.selectedCartItemIndex = null;
+      if (typeof renderCart === 'function') {
+        renderCart();
+      }
+
+      sessionStorage.removeItem('isViewMode');
+      sessionStorage.removeItem('tableViewMode');
+      sessionStorage.removeItem('tableOrderData');
+      sessionStorage.removeItem('tableViewOrderData');
+      sessionStorage.removeItem('fromTableModule');
+    }
+    window.ruiyiClearSavedTableOrderContext = ruiyiClearSavedTableOrderContext;
+
+    /**
      * 清除当前桌位显示
      */
     function clearCurrentTable() {
       // 🔥 清除当前桌位标记
       window._currentViewingTable = null;
+      if (typeof ruiyiSetCartTableIdentity === 'function') {
+        ruiyiSetCartTableIdentity('', 'clearCurrentTable');
+      }
 
       // 清空桌位输入框
       const tableInput = document.getElementById('table-number');
@@ -27574,9 +29563,13 @@ ${window.RUIYI_TRANS.createLayout}
     function cambiarEstadoMesa(mesa, nuevoEstado) {
       // 获取当前餐桌状态
       const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
+      const mesaGlobal = (typeof ruiyiSafeResolveGlobalTableNumber === 'function')
+        ? ruiyiSafeResolveGlobalTableNumber(mesa)
+        : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(mesa) : '');
+      const mesaKey = mesaGlobal && /^\d+$/.test(String(mesaGlobal)) ? `Mesa ${mesaGlobal}` : mesa;
       
       // 检查餐桌是否已有状态
-      if (!mesasEstado[mesa]) {
+      if (!mesasEstado[mesaKey] && !mesasEstado[mesa]) {
         Toastify({
           text: `⚠️ <?php echo ruiyi_translate("La mesa", "The table", "餐桌"); ?> ${mesa} <?php echo ruiyi_translate("no tiene una orden activa", "does not have an active order", "没有活动订单"); ?>`,
           duration: 3000,
@@ -27588,9 +29581,18 @@ ${window.RUIYI_TRANS.createLayout}
       }
       
       // 更新状态
-      mesasEstado[mesa].estado = nuevoEstado;
+      const state = mesasEstado[mesaKey] || mesasEstado[mesa] || {};
+      state.estado = nuevoEstado;
       // 添加状态更新时间戳
-      mesasEstado[mesa].lastUpdate = new Date().toISOString();
+      state.lastUpdate = new Date().toISOString();
+      state.table_number = state.table_number || mesa;
+      state.table_global_number = state.table_global_number || String(mesaGlobal || '');
+      state.canonical_table_key = mesaKey;
+      state.table_uid = state.table_uid || (mesaGlobal ? `table:${mesaGlobal}` : '');
+      mesasEstado[mesaKey] = state;
+      if (mesaKey !== mesa && mesasEstado[mesa]) {
+        delete mesasEstado[mesa];
+      }
       
       // 保存更新后的状态
       localStorage.setItem('mesas_estado', JSON.stringify(mesasEstado));
@@ -37803,8 +39805,41 @@ document.addEventListener('DOMContentLoaded', function() {
                 // 2. autoSaveTableOrder 返回（但异步操作还在进行中）
                 // 3. 这里的 updateLockedItemsToServer 被调用，发送不包含新 Varios 的锁定商品列表
                 // 4. 服务器收到 update_order_items，删除了"多余"的新 Varios
+                let tableContextBeforeMenuSwitch = '';
+                let hadUnsavedTableOrderBeforeMenuSwitch = false;
+                if (sectionId === 'mesas') {
+                    try {
+                        const inputTableBeforeMenu = document.getElementById('table-number')?.value.trim() || '';
+                        const viewModeBeforeMenu = typeof window.ruiyiGetActiveTableViewMode === 'function'
+                            ? window.ruiyiGetActiveTableViewMode()
+                            : JSON.parse(sessionStorage.getItem('tableViewMode') || sessionStorage.getItem('isViewMode') || 'null');
+                        const viewingTableBeforeMenu = window._currentViewingTable ? `Mesa ${window._currentViewingTable}` : '';
+                        tableContextBeforeMenuSwitch = inputTableBeforeMenu || viewModeBeforeMenu?.table || viewingTableBeforeMenu;
+                        hadUnsavedTableOrderBeforeMenuSwitch = tableContextBeforeMenuSwitch && typeof hasUnsavedTableOrder === 'function'
+                            ? hasUnsavedTableOrder()
+                            : false;
+                    } catch (contextError) {
+                        console.warn('[菜单切换] 读取桌位上下文失败:', contextError);
+                    }
+                }
                 if (typeof window.autoSaveTableOrder === 'function') {
-                    await window.autoSaveTableOrder();
+                    try {
+                        const autoSavedForMenuSwitch = await window.autoSaveTableOrder({ force: true, source: 'menu-link-switch' });
+                        if (sectionId === 'mesas' &&
+                            tableContextBeforeMenuSwitch &&
+                            typeof clearCurrentTable === 'function' &&
+                            (autoSavedForMenuSwitch || !hadUnsavedTableOrderBeforeMenuSwitch)) {
+                            console.log('[菜单切换] ✅ 返回桌位模块，清理当前桌位上下文:', {
+                                tableContextBeforeMenuSwitch,
+                                autoSavedForMenuSwitch,
+                                hadUnsavedTableOrderBeforeMenuSwitch
+                            });
+                            clearCurrentTable();
+                        }
+                    } catch (autoSaveError) {
+                        console.error('[菜单切换] ❌ 桌位订单自动保存失败，取消切换模块:', autoSaveError);
+                        return;
+                    }
                 }
 
                 // Desactivar todos los enlaces
@@ -43382,18 +45417,27 @@ function updateLocalTableStatus(tableNumber, status) {
                 }
             }
         });
-    } else {
-        // 设置状态
-        const tablePrefix = (window.RUIYI_TRANS && window.RUIYI_TRANS.table) ? window.RUIYI_TRANS.table + ' ' : 'Mesa ';
-        const tableKey = tableNumber.startsWith(tablePrefix) ? tableNumber : `${tablePrefix}${tableNumber}`;
+	    } else {
+	        // 设置状态
+	        const tableNumeric = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+	            ? ruiyiSafeResolveGlobalTableNumber(tableNumber)
+	            : resolveGlobalTableNumber(tableNumber);
+	        const tableKey = `Mesa ${tableNumeric || tableNumber}`;
+	        const tableDisplayName = typeof ruiyiResolveTableDisplayName === 'function'
+	            ? ruiyiResolveTableDisplayName(tableNumber, tableNumber)
+	            : tableNumber;
 
-        mesasEstado[tableKey] = {
-            estado: localStatus,
-            timestamp: new Date().toISOString(),
-            orderId: null,
-            total: 0
-        };
-    }
+	        mesasEstado[tableKey] = {
+	            estado: localStatus,
+	            timestamp: new Date().toISOString(),
+	            orderId: null,
+	            total: 0,
+	            table_number: tableDisplayName,
+	            table_global_number: String(tableNumeric || ''),
+	            canonical_table_key: tableKey,
+	            table_uid: tableNumeric ? `table:${tableNumeric}` : ''
+	        };
+	    }
 
     localStorage.setItem('mesas_estado', JSON.stringify(mesasEstado));
 
@@ -43464,8 +45508,13 @@ function updateTableStatusToServer(tableNumber, status, orderId = null, total = 
     if (/^\d+$/.test(_safeInput)) {
         _safeInput = 'Mesa ' + _safeInput;
     }
-    const numericTableNumber = resolveGlobalTableNumber(_safeInput);
-    formData.append('table_id', numericTableNumber);
+	    const numericTableNumber = resolveGlobalTableNumber(_safeInput);
+	    formData.append('table_id', numericTableNumber);
+	    formData.append('table_global_number', numericTableNumber);
+	    formData.append('table_uid', 'table:' + numericTableNumber);
+	    if (typeof ruiyiResolveTableDisplayName === 'function') {
+	        formData.append('table_display_name', ruiyiResolveTableDisplayName(tableNumber, tableNumber));
+	    }
     
     // 状态映射：确保发送正确的状态值
     let serverStatus = status;
@@ -54000,23 +56049,25 @@ function ruiyiResolveActiveTableNumber(fallbackTableNumber, options = {}) {
     currentViewingTable = `Mesa ${window._currentViewingTable}`;
   }
 
-  const selected = preferFallback
-    ? (fallback || inputTable || viewTable || currentViewingTable)
-    : (inputTable || viewTable || fallback || currentViewingTable);
-  const selectedGlobal = ruiyiResolvePrebillGlobalNumber(selected);
-  const fallbackGlobal = ruiyiResolvePrebillGlobalNumber(fallback);
+	  const selected = preferFallback
+	    ? (fallback || inputTable || viewTable || currentViewingTable)
+	    : (inputTable || viewTable || fallback || currentViewingTable);
+	  const selectedGlobal = ruiyiResolvePrebillGlobalNumber(selected);
+	  const fallbackGlobal = ruiyiResolvePrebillGlobalNumber(fallback);
   if (selected && fallback && selectedGlobal && fallbackGlobal && selectedGlobal !== fallbackGlobal) {
     console.warn(preferFallback ? '[桌位] 当前桌位状态与按钮桌位不一致，已使用按钮桌位:' : '[桌位] 按钮桌位与当前桌位不一致，已使用当前桌位:', {
       buttonTable: fallback,
       activeTable: selected,
       buttonGlobal: fallbackGlobal,
       activeGlobal: selectedGlobal,
-      preferFallback
-    });
-  }
-
-  return selected;
-}
+	      preferFallback
+	    });
+	  }
+	
+	  return selectedGlobal && typeof ruiyiResolveTableDisplayName === 'function'
+	    ? ruiyiResolveTableDisplayName(selected, selected)
+	    : selected;
+	}
 
 function ruiyiResolveActivePrebillTableNumber(fallbackTableNumber) {
   return ruiyiResolveActiveTableNumber(fallbackTableNumber, { preferFallback: true });
@@ -54038,6 +56089,148 @@ function ruiyiGetCartTableIdentity() {
     source: window._ruiyiCurrentCartTableSource || ''
   };
 }
+
+function ruiyiResolveCurrentTableUiContext(source = '', options = {}) {
+  const inputEl = document.getElementById('table-number');
+  const inputValue = ruiyiPrebillString(inputEl?.value);
+  const displayValue = ruiyiPrebillString(document.getElementById('current-table-name')?.textContent);
+  const inputGlobal = inputValue ? ruiyiResolvePrebillGlobalNumber(inputValue) : '';
+  const displayGlobal = displayValue ? ruiyiResolvePrebillGlobalNumber(displayValue) : '';
+  const cartIdentity = typeof ruiyiGetCartTableIdentity === 'function'
+    ? ruiyiGetCartTableIdentity()
+    : { globalNumber: '', source: '' };
+  const currentViewingGlobal = window._currentViewingTable !== undefined &&
+    window._currentViewingTable !== null &&
+    window._currentViewingTable !== ''
+    ? String(window._currentViewingTable)
+    : '';
+  let viewGlobal = '';
+  try {
+    const viewMode = typeof ruiyiGetActiveTableViewMode === 'function'
+      ? ruiyiGetActiveTableViewMode()
+      : null;
+    viewGlobal = viewMode?.table ? ruiyiResolvePrebillGlobalNumber(viewMode.table) : '';
+  } catch (error) {
+    viewGlobal = '';
+  }
+
+  let cartItemGlobal = '';
+  try {
+    const liveCart = Array.isArray(cart) ? cart : [];
+    const itemGlobals = [...new Set(liveCart
+      .filter(item => item && parseFloat(item.quantity || 0) > 0)
+      .map(item => item._table_global_number || item.table_global_number || item.cart_gtn || '')
+      .map(value => String(value || '').trim())
+      .filter(Boolean))];
+    if (itemGlobals.length === 1) {
+      cartItemGlobal = itemGlobals[0];
+    }
+  } catch (error) {
+    cartItemGlobal = '';
+  }
+
+  let preferredGlobal = inputGlobal || displayGlobal || cartItemGlobal;
+  if (!preferredGlobal && options.allowFallbackContext === true) {
+    preferredGlobal = cartIdentity.globalNumber || currentViewingGlobal || viewGlobal;
+  }
+  if (inputGlobal && displayGlobal && inputGlobal !== displayGlobal) {
+    const identityGlobal = cartItemGlobal || cartIdentity.globalNumber || currentViewingGlobal;
+    preferredGlobal = (identityGlobal && identityGlobal === inputGlobal) ? inputGlobal : displayGlobal;
+    console.warn('[桌位上下文] 检测到输入框与右侧标题不一致，已重新校准:', {
+      source,
+      inputValue,
+      inputGlobal,
+      displayValue,
+      displayGlobal,
+      cartIdentity,
+      currentViewingGlobal,
+      preferredGlobal
+    });
+  }
+  if (!preferredGlobal) {
+    return {
+      globalNumber: '',
+      displayName: '',
+      inputValue,
+      displayValue,
+      inputGlobal,
+      displayGlobal,
+      cartIdentity,
+      currentViewingGlobal,
+      viewGlobal
+    };
+  }
+
+  const preferredDisplay = typeof ruiyiResolveTableDisplayName === 'function'
+    ? ruiyiResolveTableDisplayName(`Mesa ${preferredGlobal}`, `Mesa ${preferredGlobal}`)
+    : `Mesa ${preferredGlobal}`;
+
+  if (options.apply !== false) {
+    window._currentViewingTable = String(preferredGlobal);
+    if (typeof ruiyiSetCartTableIdentity === 'function') {
+      ruiyiSetCartTableIdentity(preferredGlobal, source || 'resolve-current-table-ui-context');
+    }
+    if (inputEl && (!inputValue || inputGlobal !== String(preferredGlobal))) {
+      inputEl.value = preferredDisplay;
+    }
+    if (displayValue && displayGlobal !== String(preferredGlobal) && typeof updateCurrentTableDisplay === 'function') {
+      updateCurrentTableDisplay(preferredDisplay);
+    }
+    if (viewGlobal && viewGlobal !== String(preferredGlobal)) {
+      sessionStorage.removeItem('tableViewMode');
+      sessionStorage.removeItem('isViewMode');
+      sessionStorage.removeItem('tableOrderData');
+      sessionStorage.removeItem('tableViewOrderData');
+    }
+  }
+
+  return {
+    globalNumber: String(preferredGlobal),
+    displayName: preferredDisplay,
+    inputValue,
+    displayValue,
+    inputGlobal,
+    displayGlobal,
+    cartItemGlobal,
+    cartIdentity,
+    currentViewingGlobal,
+    viewGlobal
+  };
+}
+window.ruiyiResolveCurrentTableUiContext = ruiyiResolveCurrentTableUiContext;
+
+function ruiyiDropCartIfTableContextMismatch(ctx, source = '') {
+  if (!ctx || !ctx.globalNumber || !Array.isArray(cart) || cart.length === 0) return false;
+  const cartIdentity = typeof ruiyiGetCartTableIdentity === 'function'
+    ? ruiyiGetCartTableIdentity()
+    : { globalNumber: '' };
+  const liveItemGlobals = [...new Set(cart
+    .filter(item => item && parseFloat(item.quantity || 0) > 0)
+    .map(item => item._table_global_number || item.table_global_number || item.cart_gtn || '')
+    .map(value => String(value || '').trim())
+    .filter(Boolean))];
+  const identityMismatch = cartIdentity.globalNumber && cartIdentity.globalNumber !== ctx.globalNumber;
+  const itemMismatch = liveItemGlobals.length > 0 && liveItemGlobals.some(global => global !== ctx.globalNumber);
+  if (!identityMismatch && !itemMismatch) return false;
+
+  console.warn('[桌位上下文] 当前购物车属于其他桌位，已清除以避免串单:', {
+    source,
+    targetGlobal: ctx.globalNumber,
+    cartIdentity,
+    liveItemGlobals,
+    cartItems: cart.length
+  });
+  cart = [];
+  window.cart = cart;
+  window.cartModified = false;
+  selectedCartItemIndex = null;
+  window.selectedCartItemIndex = null;
+  if (typeof renderCart === 'function') {
+    renderCart();
+  }
+  return true;
+}
+window.ruiyiDropCartIfTableContextMismatch = ruiyiDropCartIfTableContextMismatch;
 
 function ruiyiGetPrebillLinePrice(item) {
   if (!item) return 0;
