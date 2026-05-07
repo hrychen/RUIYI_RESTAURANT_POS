@@ -4133,9 +4133,93 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
     }
     window.ruiyiGetActiveTableViewMode = ruiyiGetActiveTableViewMode;
 
-    function ruiyiSafeResolveGlobalTableNumber(tableNumber) {
+    function ruiyiNormalizeTableIdentityText(value) {
+        return String(value ?? '').replace(/\s+/g, '').toUpperCase();
+    }
+
+    function ruiyiGetTableMappingsArray() {
+        const mappingsRaw = window.tableCategoryMappings || {};
+        return Array.isArray(mappingsRaw) ? mappingsRaw : Object.values(mappingsRaw || {});
+    }
+
+    function ruiyiFindExactTableMappingByDisplay(tableNumber) {
+        const rawNorm = ruiyiNormalizeTableIdentityText(tableNumber);
+        if (!rawNorm) return null;
+        return ruiyiGetTableMappingsArray().find(m => {
+            if (!m) return false;
+            const localNumber = m.local_table_number ?? m.table_number_in_category;
+            const candidates = [
+                m.category_display_name,
+                m.display_name,
+                m.category_name && localNumber !== undefined ? `${m.category_name}${localNumber}` : '',
+                m.category_name && localNumber !== undefined ? `${m.category_name} ${localNumber}` : ''
+            ].filter(Boolean);
+            return candidates.some(candidate => ruiyiNormalizeTableIdentityText(candidate) === rawNorm);
+        }) || null;
+    }
+    window.ruiyiFindExactTableMappingByDisplay = ruiyiFindExactTableMappingByDisplay;
+
+    function ruiyiResolveDomTableContextGlobal(rawTable = '') {
+        const rawNorm = ruiyiNormalizeTableIdentityText(rawTable);
+        const checkElement = (el) => {
+            if (!el || !el.dataset) return '';
+            const global = String(el.dataset.globalTableNumber || '').trim();
+            if (!global || !/^\d+$/.test(global)) return '';
+            if (!rawNorm) return global;
+            const elementValue = el.value !== undefined ? el.value : el.textContent;
+            const display = el.dataset.tableDisplayName || elementValue || '';
+            const canonical = el.dataset.canonicalTableKey || (global ? `Mesa ${global}` : '');
+            const candidates = [elementValue, display, canonical].filter(Boolean);
+            return candidates.some(candidate => ruiyiNormalizeTableIdentityText(candidate) === rawNorm) ? global : '';
+        };
+
+        return checkElement(document.getElementById('table-number')) ||
+            checkElement(document.getElementById('current-table-name')) ||
+            checkElement(document.getElementById('current-table-display')) ||
+            '';
+    }
+
+    function ruiyiSetTableElementContext(el, globalNumber = '', displayName = '') {
+        if (!el || !el.dataset) return;
+        const global = String(globalNumber || '').trim();
+        const display = String(displayName || '').trim();
+        if (global && /^\d+$/.test(global)) {
+            el.dataset.globalTableNumber = global;
+            el.dataset.canonicalTableKey = `Mesa ${global}`;
+            el.dataset.tableUid = `table:${global}`;
+        } else {
+            delete el.dataset.globalTableNumber;
+            delete el.dataset.canonicalTableKey;
+            delete el.dataset.tableUid;
+        }
+        if (display) {
+            el.dataset.tableDisplayName = display;
+        } else {
+            delete el.dataset.tableDisplayName;
+        }
+    }
+    window.ruiyiSetTableElementContext = ruiyiSetTableElementContext;
+
+    function ruiyiClearTableElementContext(el) {
+        if (!el || !el.dataset) return;
+        delete el.dataset.globalTableNumber;
+        delete el.dataset.canonicalTableKey;
+        delete el.dataset.tableUid;
+        delete el.dataset.tableDisplayName;
+    }
+    window.ruiyiClearTableElementContext = ruiyiClearTableElementContext;
+
+    function ruiyiSafeResolveGlobalTableNumber(tableNumber, options = {}) {
         const raw = String(tableNumber ?? '').trim();
         if (!raw) return '';
+        const domGlobal = ruiyiResolveDomTableContextGlobal(raw);
+        if (domGlobal) return domGlobal;
+        if (options && options.preferExactDisplay === true) {
+            const exactMapping = ruiyiFindExactTableMappingByDisplay(raw);
+            if (exactMapping && exactMapping.global_table_number !== undefined && exactMapping.global_table_number !== null) {
+                return String(exactMapping.global_table_number).trim();
+            }
+        }
         const resolverInput = /^\d+$/.test(raw) ? `Mesa ${raw}` : raw;
         return typeof resolveGlobalTableNumber === 'function'
             ? resolveGlobalTableNumber(resolverInput)
@@ -4150,6 +4234,15 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         const mappings = Array.isArray(mappingsRaw) ? mappingsRaw : Object.values(mappingsRaw || {});
         const normalize = value => String(value ?? '').replace(/\s+/g, '').toUpperCase();
         const rawNorm = normalize(raw);
+        const domGlobal = typeof ruiyiResolveDomTableContextGlobal === 'function'
+            ? ruiyiResolveDomTableContextGlobal(raw)
+            : '';
+        if (domGlobal) {
+            const domMapping = mappings.find(m => String(m?.global_table_number ?? '').trim() === String(domGlobal));
+            if (domMapping) {
+                return String(domMapping.category_display_name || domMapping.display_name || `Mesa ${domGlobal}`).trim();
+            }
+        }
         const canonicalMesaMatch = raw.match(/^Mesa\s*(\d+)$/);
 
         if (canonicalMesaMatch) {
@@ -4458,6 +4551,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             const tableNumberInput = document.getElementById('table-number');
             if (tableNumberInput) {
                 tableNumberInput.value = '';
+                if (typeof ruiyiClearTableElementContext === 'function') {
+                    ruiyiClearTableElementContext(tableNumberInput);
+                }
             }
             if (typeof updateCurrentTableDisplay === 'function') {
                 updateCurrentTableDisplay('');
@@ -4509,6 +4605,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             const tableNumberInput = document.getElementById('table-number');
             if (tableNumberInput) {
                 tableNumberInput.value = '';
+                if (typeof ruiyiClearTableElementContext === 'function') {
+                    ruiyiClearTableElementContext(tableNumberInput);
+                }
             }
             if (typeof updateCurrentTableDisplay === 'function') {
                 updateCurrentTableDisplay('');
@@ -10693,9 +10792,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         return false;
       }
 
-      if (typeof ruiyiResolveCurrentTableUiContext === 'function') {
-        ruiyiResolveCurrentTableUiContext('autoSaveTableOrder:preflight');
-      }
+      const _autoSaveUiTableCtx = typeof ruiyiResolveCurrentTableUiContext === 'function'
+        ? ruiyiResolveCurrentTableUiContext('autoSaveTableOrder:preflight')
+        : null;
 
       // 🔥🔥🔥 【2026-03-29 关键修复】AA金额分单进行中或正在结算时，跳过自动保存
       // 防止 AA 结账过程��� autoSave 将旧 cart 写入 mesas_estado 导致重复订单
@@ -10752,7 +10851,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       }
 
       const clearCtxForAutoSave = typeof ruiyiResolveTableClearContext === 'function'
-        ? ruiyiResolveTableClearContext(table_number)
+        ? ruiyiResolveTableClearContext(table_number, { preferredGlobalNumber: _autoSaveUiTableCtx?.globalNumber || '' })
         : null;
       const shouldClearEmptyTable = _allowEmptyTableClear && clearCtxForAutoSave && typeof ruiyiShouldClearEmptyTableContext === 'function'
         ? ruiyiShouldClearEmptyTableContext(clearCtxForAutoSave)
@@ -10790,7 +10889,12 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             cart = [];
             window.cart = cart;
             const tableNumberInput = document.getElementById('table-number');
-            if (tableNumberInput) tableNumberInput.value = '';
+            if (tableNumberInput) {
+              tableNumberInput.value = '';
+              if (typeof ruiyiClearTableElementContext === 'function') {
+                ruiyiClearTableElementContext(tableNumberInput);
+              }
+            }
             if (typeof renderCart === 'function') renderCart();
           }
           window.cartModified = false;
@@ -10819,9 +10923,10 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
       // 🔥🔥🔥 关键修复：检查是否刚刚同步过，避免重复同步
       // 🔥🔥🔥 【2026-04-06 关键修复】使用 resolveGlobalTableNumber 规范化桌号
-      const _autoResolvedNum = (typeof ruiyiSafeResolveGlobalTableNumber === 'function')
-        ? ruiyiSafeResolveGlobalTableNumber(table_number)
-        : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(table_number) : null);
+      const _autoResolvedNum = _autoSaveUiTableCtx?.globalNumber ||
+        (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+          ? ruiyiSafeResolveGlobalTableNumber(table_number, { preferExactDisplay: true })
+          : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(table_number) : null));
       const _autoFallback = table_number.replace(/^(餐桌|Mesa|Table)\s*/, '');
       const tableNum = (_autoResolvedNum && /^\d+$/.test(String(_autoResolvedNum)))
         ? String(_autoResolvedNum)
@@ -11370,9 +11475,10 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       // 防止自定义名（如 "T16", "厅1"）被当作 mesaKey 的后缀导致跨桌位串单
       // 原 bug: table_number.replace(/^(餐桌|Mesa|Table)\s*/, '') 对自定义名无效
       // 例如 "T16" 经过 replace 仍是 "T16"，mesaKey 变成 "Mesa T16" 而非正确的 "Mesa 27"
-      const _resolvedTableNum = (typeof ruiyiSafeResolveGlobalTableNumber === 'function')
-        ? ruiyiSafeResolveGlobalTableNumber(table_number)
-        : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(table_number) : null);
+      const _resolvedTableNum = _quickSaveUiTableCtx?.globalNumber ||
+        (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+          ? ruiyiSafeResolveGlobalTableNumber(table_number, { preferExactDisplay: true })
+          : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(table_number) : null));
       const _fallbackStrip = table_number.replace(/^(餐桌|Mesa|Table)\s*/, '');
       // 优先使用解析后的全局编号（纯数字），失败则回退到剥离前缀
       const _normalizedTableNum = (_resolvedTableNum && /^\d+$/.test(String(_resolvedTableNum)))
@@ -14956,7 +15062,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       }
 
       // 保存桌位订单按钮 - 🚀 PWA优化：使用乐观更新策略
-      function ruiyiResolveTableClearContext(rawTable = '') {
+      function ruiyiResolveTableClearContext(rawTable = '', options = {}) {
         const candidates = [];
         const pushCandidate = (value) => {
           const normalized = String(value || '').trim();
@@ -14980,10 +15086,14 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           }
         }
 
+        const preferredGlobalNumber = options && options.preferredGlobalNumber && /^\d+$/.test(String(options.preferredGlobalNumber))
+          ? String(options.preferredGlobalNumber)
+          : '';
         for (const candidate of candidates) {
-          const globalNumber = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
-            ? ruiyiSafeResolveGlobalTableNumber(candidate)
-            : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(candidate) : '');
+          const useExactDisplay = hasExplicitTable || candidate === document.getElementById('table-number')?.value;
+          const globalNumber = preferredGlobalNumber || (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+            ? ruiyiSafeResolveGlobalTableNumber(candidate, { preferExactDisplay: useExactDisplay })
+            : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(candidate) : ''));
           if (globalNumber && /^\d+$/.test(String(globalNumber))) {
             const displayName = typeof ruiyiResolveTableDisplayName === 'function'
               ? ruiyiResolveTableDisplayName(candidate, candidate)
@@ -15252,11 +15362,11 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 	          const _saveActiveTable = typeof ruiyiResolveActiveTableNumber === 'function'
 	            ? ruiyiResolveActiveTableNumber(_saveInputTable || '', { preferFallback: false })
 	            : _saveInputTable;
-	          const _saveResolvedTableRaw = _saveInputTable
+	          const _saveResolvedTableRaw = _saveUiTableCtx?.globalNumber || (_saveInputTable
 	            ? (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
-	                ? ruiyiSafeResolveGlobalTableNumber(_saveInputTable)
+	                ? ruiyiSafeResolveGlobalTableNumber(_saveInputTable, { preferExactDisplay: true })
 	                : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(_saveInputTable) : null))
-            : null;
+	            : null);
           const _saveResolvedTable = _saveResolvedTableRaw !== null && _saveResolvedTableRaw !== undefined
             ? String(_saveResolvedTableRaw)
             : '';
@@ -15272,6 +15382,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 	                (typeof ruiyiResolveTableDisplayName === 'function'
 	                  ? ruiyiResolveTableDisplayName(_saveStartTable, `Mesa ${_saveStartTable}`)
 	                  : `Mesa ${_saveStartTable}`);
+	              if (typeof ruiyiSetTableElementContext === 'function') {
+	                ruiyiSetTableElementContext(_tableInputForSave, _saveStartTable, _tableInputForSave.value);
+	              }
 	              console.warn('[saveTableOrderBtn] table-number 为空，已补回当前桌位:', _tableInputForSave.value);
 	            }
 	          }
@@ -15285,7 +15398,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             ? ruiyiCartHasPositiveItems(cart)
             : (Array.isArray(cart) && cart.some(item => parseFloat(item?.quantity ?? 0) > 0));
           const clearCtx = typeof ruiyiResolveTableClearContext === 'function'
-            ? ruiyiResolveTableClearContext(_saveActiveTable || _saveInputTable || (_saveStartTable ? `Mesa ${_saveStartTable}` : ''))
+            ? ruiyiResolveTableClearContext(_saveActiveTable || _saveInputTable || (_saveStartTable ? `Mesa ${_saveStartTable}` : ''), { preferredGlobalNumber: _saveUiTableCtx?.globalNumber || _saveResolvedTable || '' })
             : null;
           const shouldClearManualSaveTable = !hasPositiveCartItemsForManualSave &&
             clearCtx &&
@@ -15470,9 +15583,9 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             : (document.getElementById('table-number')?.value.trim() || (_saveStartTable ? `Mesa ${_saveStartTable}` : ''));
           const _saveTableNumForPostSave = (orderData && orderData.tableNum)
             ? String(orderData.tableNum)
-            : (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
-                ? String(ruiyiSafeResolveGlobalTableNumber(_saveTableForPostSave) || '')
-                : String((_saveTableForPostSave || '').replace(/^(餐桌|Mesa|Table)\s*/i, '')));
+            : (_saveResolvedTable || (typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+                ? String(ruiyiSafeResolveGlobalTableNumber(_saveTableForPostSave, { preferExactDisplay: true }) || '')
+                : String((_saveTableForPostSave || '').replace(/^(餐桌|Mesa|Table)\s*/i, ''))));
           const _saveMesaKeyForPostSave = (orderData && orderData.mesaKey)
             ? orderData.mesaKey
             : (_saveTableNumForPostSave ? `Mesa ${_saveTableNumForPostSave}` : '');
@@ -15597,7 +15710,12 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
               ruiyiSetCartTableIdentity('', 'saveTableOrderBtn:post-success');
             }
             const _savedTableInput = document.getElementById('table-number');
-            if (_savedTableInput) _savedTableInput.value = '';
+            if (_savedTableInput) {
+              _savedTableInput.value = '';
+              if (typeof ruiyiClearTableElementContext === 'function') {
+                ruiyiClearTableElementContext(_savedTableInput);
+              }
+            }
             cart = [];
             window.cart = cart;
             window.cartModified = false;
@@ -20749,7 +20867,13 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 	      if (typeof ruiyiSetCartTableIdentity === 'function') {
 	        ruiyiSetCartTableIdentity(cleanTableNumber, 'loadTableOrderToCart');
 	      }
-	      document.getElementById('table-number').value = displayTableNumber || cleanTableNumber;
+	      const tableNumberInputForLoad = document.getElementById('table-number');
+	      if (tableNumberInputForLoad) {
+	        tableNumberInputForLoad.value = displayTableNumber || cleanTableNumber;
+	        if (typeof ruiyiSetTableElementContext === 'function') {
+	          ruiyiSetTableElementContext(tableNumberInputForLoad, cleanTableNumber, displayTableNumber || cleanTableNumber);
+	        }
+	      }
 	      // 🔥 更新购物车上方的桌位号显示
 	      updateCurrentTableDisplay(displayTableNumber || cleanTableNumber);
 	      try {
@@ -29086,6 +29210,9 @@ ${window.RUIYI_TRANS.createLayout}
 	      const tableNumberInput = document.getElementById('table-number');
 	      if (tableNumberInput) {
 	        tableNumberInput.value = displaySelection || resolvedSelection;
+	        if (typeof ruiyiSetTableElementContext === 'function') {
+	          ruiyiSetTableElementContext(tableNumberInput, resolvedSelection, displaySelection || resolvedSelection);
+	        }
 	        // 🔥 更新购物车上方的桌位号显示（仍用原始名，保留自定义显示）
 	        updateCurrentTableDisplay(displaySelection || mesaSeleccionada);
 	      }
@@ -29230,6 +29357,10 @@ ${window.RUIYI_TRANS.createLayout}
         // 如果没有桌位号，隐藏显示区域
         displayDiv.classList.add('hidden');
         tableName.textContent = '';
+        if (typeof ruiyiClearTableElementContext === 'function') {
+          ruiyiClearTableElementContext(tableName);
+          ruiyiClearTableElementContext(displayDiv);
+        }
         return;
       }
 
@@ -29241,7 +29372,7 @@ ${window.RUIYI_TRANS.createLayout}
       // 尝试从桌位映射中获取完整的分类显示名称
       if (window.tableCategoryMappings && displayName === tableNumber) {
         const resolvedTableNum = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
-          ? ruiyiSafeResolveGlobalTableNumber(tableNumber)
+          ? ruiyiSafeResolveGlobalTableNumber(tableNumber, { preferExactDisplay: true })
           : (typeof resolveGlobalTableNumber === 'function' ? resolveGlobalTableNumber(tableNumber) : '');
         const tableNum = /^\d+$/.test(String(resolvedTableNum || '')) ? parseInt(resolvedTableNum, 10) : NaN;
 
@@ -29264,6 +29395,14 @@ ${window.RUIYI_TRANS.createLayout}
       // 更新显示
       tableName.textContent = displayName;
       displayDiv.classList.remove('hidden');
+      const resolvedDisplayGlobal = typeof ruiyiSafeResolveGlobalTableNumber === 'function'
+        ? (ruiyiSafeResolveGlobalTableNumber(displayName, { preferExactDisplay: true }) ||
+           ruiyiSafeResolveGlobalTableNumber(tableNumber))
+        : '';
+      if (typeof ruiyiSetTableElementContext === 'function') {
+        ruiyiSetTableElementContext(tableName, resolvedDisplayGlobal, displayName);
+        ruiyiSetTableElementContext(displayDiv, resolvedDisplayGlobal, displayName);
+      }
 
       // 🔥 更新 delivery 客户信息显示
       updateDeliveryCustomerInfoDisplay(displayName || tableNumber);
@@ -29424,6 +29563,9 @@ ${window.RUIYI_TRANS.createLayout}
       const tableInput = document.getElementById('table-number');
       if (tableInput) {
         tableInput.value = '';
+        if (typeof ruiyiClearTableElementContext === 'function') {
+          ruiyiClearTableElementContext(tableInput);
+        }
       }
 
       if (typeof updateCurrentTableDisplay === 'function') {
@@ -29461,6 +29603,9 @@ ${window.RUIYI_TRANS.createLayout}
       const tableInput = document.getElementById('table-number');
       if (tableInput) {
         tableInput.value = '';
+        if (typeof ruiyiClearTableElementContext === 'function') {
+          ruiyiClearTableElementContext(tableInput);
+        }
       }
 
       // 隐藏显示区域
@@ -56028,10 +56173,20 @@ function ruiyiPrebillString(value) {
   return value === undefined || value === null ? '' : String(value).trim();
 }
 
-function ruiyiResolvePrebillGlobalNumber(value) {
+function ruiyiResolvePrebillGlobalNumber(value, options = {}) {
   const raw = ruiyiPrebillString(value);
   if (!raw) return '';
-  const internalMesaMatch = raw.match(/^(?:Mesa|餐桌|Table|桌位)\s*(\d+)$/i);
+  if (typeof ruiyiResolveDomTableContextGlobal === 'function') {
+    const domGlobal = ruiyiResolveDomTableContextGlobal(raw);
+    if (domGlobal) return domGlobal;
+  }
+  if (options && options.preferExactDisplay === true && typeof ruiyiFindExactTableMappingByDisplay === 'function') {
+    const exactMapping = ruiyiFindExactTableMappingByDisplay(raw);
+    if (exactMapping && exactMapping.global_table_number !== undefined && exactMapping.global_table_number !== null) {
+      return String(exactMapping.global_table_number).trim();
+    }
+  }
+  const internalMesaMatch = raw.match(/^(?:Mesa|餐桌|Table|桌位)\s*(\d+)$/);
   if (internalMesaMatch) return internalMesaMatch[1];
   if (/^\d+$/.test(raw)) return raw;
   try {
@@ -56070,8 +56225,8 @@ function ruiyiResolveActiveTableNumber(fallbackTableNumber, options = {}) {
 	  const selected = preferFallback
 	    ? (fallback || inputTable || viewTable || currentViewingTable)
 	    : (inputTable || viewTable || fallback || currentViewingTable);
-	  const selectedGlobal = ruiyiResolvePrebillGlobalNumber(selected);
-	  const fallbackGlobal = ruiyiResolvePrebillGlobalNumber(fallback);
+  const selectedGlobal = ruiyiResolvePrebillGlobalNumber(selected, { preferExactDisplay: selected === inputTable || selected === fallback });
+  const fallbackGlobal = ruiyiResolvePrebillGlobalNumber(fallback, { preferExactDisplay: true });
   if (selected && fallback && selectedGlobal && fallbackGlobal && selectedGlobal !== fallbackGlobal) {
     console.warn(preferFallback ? '[桌位] 当前桌位状态与按钮桌位不一致，已使用按钮桌位:' : '[桌位] 按钮桌位与当前桌位不一致，已使用当前桌位:', {
       buttonTable: fallback,
@@ -56110,10 +56265,13 @@ function ruiyiGetCartTableIdentity() {
 
 function ruiyiResolveCurrentTableUiContext(source = '', options = {}) {
   const inputEl = document.getElementById('table-number');
+  const displayEl = document.getElementById('current-table-name');
   const inputValue = ruiyiPrebillString(inputEl?.value);
-  const displayValue = ruiyiPrebillString(document.getElementById('current-table-name')?.textContent);
-  const inputGlobal = inputValue ? ruiyiResolvePrebillGlobalNumber(inputValue) : '';
-  const displayGlobal = displayValue ? ruiyiResolvePrebillGlobalNumber(displayValue) : '';
+  const displayValue = ruiyiPrebillString(displayEl?.textContent);
+  const inputDatasetGlobal = inputEl?.dataset?.globalTableNumber ? String(inputEl.dataset.globalTableNumber).trim() : '';
+  const displayDatasetGlobal = displayEl?.dataset?.globalTableNumber ? String(displayEl.dataset.globalTableNumber).trim() : '';
+  const inputGlobal = inputDatasetGlobal || (inputValue ? ruiyiResolvePrebillGlobalNumber(inputValue, { preferExactDisplay: true }) : '');
+  const displayGlobal = displayDatasetGlobal || (displayValue ? ruiyiResolvePrebillGlobalNumber(displayValue, { preferExactDisplay: true }) : '');
   const cartIdentity = typeof ruiyiGetCartTableIdentity === 'function'
     ? ruiyiGetCartTableIdentity()
     : { globalNumber: '', source: '' };
@@ -56190,6 +56348,9 @@ function ruiyiResolveCurrentTableUiContext(source = '', options = {}) {
     }
     if (inputEl && (!inputValue || inputGlobal !== String(preferredGlobal))) {
       inputEl.value = preferredDisplay;
+    }
+    if (inputEl && typeof ruiyiSetTableElementContext === 'function') {
+      ruiyiSetTableElementContext(inputEl, preferredGlobal, preferredDisplay);
     }
     if (displayValue && displayGlobal !== String(preferredGlobal) && typeof updateCurrentTableDisplay === 'function') {
       updateCurrentTableDisplay(preferredDisplay);
