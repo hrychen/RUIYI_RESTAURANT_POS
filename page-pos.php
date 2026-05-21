@@ -23652,8 +23652,6 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       const item = cart[index];
       const currentPercent = parseFloat(item.discountPercent || 0) || 0;
 
-      let deliveryReorderCopyCompleted = false;
-
       const result = await Swal.fire({
         title: '<?php echo ruiyi_translate('Descuento de producto', 'Item discount', '单品折扣'); ?>',
         input: 'number',
@@ -26379,6 +26377,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
       const mapping = getTableMappingByTableName(tableName);
       const categoryInfo = mapping ? getCategoryInfoById(mapping.category_id) : null;
       const zoneName = getZoneDisplayNameForTable(tableName);
+      let deliveryReorderCopyCompleted = false;
 
       // 🔥 检查桌位状态，如果是空闲的，清空已保存的delivery数据
       const mesasEstado = JSON.parse(localStorage.getItem('mesas_estado') || '{}');
