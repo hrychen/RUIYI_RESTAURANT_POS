@@ -26457,12 +26457,29 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           /* 🔥 确保grid单元格不会裁剪下拉菜单 */
           .grid > div { overflow: visible; }
           .grid { overflow: visible; }
-          /* 🔥 修复SweetAlert2弹窗容器overflow问题 */
-          .swal2-popup.delivery-customer-modal { overflow: visible !important; max-width: 95vw !important; }
-          .swal2-popup.delivery-customer-modal .swal2-html-container { overflow: visible !important; }
+          /* 🔥 外送客户弹窗：表单内容内部滚动，底部按钮始终留在白色弹窗内 */
+          .swal2-popup.delivery-customer-modal {
+            box-sizing: border-box !important;
+            display: flex !important;
+            flex-direction: column !important;
+            max-height: calc(100vh - 40px) !important;
+            max-width: 95vw !important;
+            overflow: hidden !important;
+            padding-bottom: 28px !important;
+          }
+          .swal2-popup.delivery-customer-modal .swal2-html-container {
+            flex: 1 1 auto !important;
+            margin-bottom: 0 !important;
+            max-height: calc(100vh - 180px) !important;
+            overflow-x: hidden !important;
+            overflow-y: auto !important;
+            padding-bottom: 12px !important;
+          }
           .swal2-popup.delivery-customer-modal .text-left { overflow: visible; }
           .swal2-popup.delivery-customer-modal .swal2-actions {
-            margin-top: 28px !important;
+            flex: 0 0 auto !important;
+            margin-bottom: 0 !important;
+            margin-top: 18px !important;
             padding-top: 8px !important;
           }
           .delivery-reorder-panel {
