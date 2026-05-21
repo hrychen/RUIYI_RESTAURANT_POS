@@ -5325,6 +5325,92 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
     }
     window.ruiyiSuppressPosCartStorage = ruiyiSuppressPosCartStorage;
 
+    function ruiyiForceClearCartState(reason = 'cart_clear') {
+        try {
+            const emptyCart = [];
+
+            if (typeof syncCart === 'function') {
+                syncCart(emptyCart);
+            } else {
+                cart = emptyCart;
+                window.cart = emptyCart;
+            }
+
+            if (window.CartManager) {
+                try {
+                    window.CartManager.cart = emptyCart;
+                    window.CartManager.selectedIndex = null;
+                    window.CartManager.discountPercent = 0;
+                    if (typeof window.CartManager.sync === 'function') {
+                        window.CartManager.sync();
+                    }
+                } catch (managerError) {
+                    console.warn('[购物车清理] CartManager同步失败:', reason, managerError);
+                }
+            }
+
+            cart = emptyCart;
+            window.cart = emptyCart;
+            window.selectedCartItemIndex = null;
+            window.currentDiscountPercent = 0;
+            window.cartModified = false;
+
+            if (typeof clearCartSelection === 'function') {
+                clearCartSelection();
+            }
+            if (typeof updateDiscountBadge === 'function') {
+                updateDiscountBadge();
+            }
+            if (typeof renderCart === 'function') {
+                renderCart();
+            }
+        } catch (error) {
+            console.warn('[购物车清理] 强制清空失败:', reason, error);
+        }
+    }
+    window.ruiyiForceClearCartState = ruiyiForceClearCartState;
+
+    function ruiyiClearQuickCheckoutCart(reason = 'quick_checkout_complete') {
+        try {
+            if (typeof ruiyiSuppressPosCartStorage === 'function') {
+                ruiyiSuppressPosCartStorage(7000, reason);
+            } else if (typeof clearPosCartStorage === 'function') {
+                clearPosCartStorage();
+            }
+
+            if (typeof ruiyiForceClearCartState === 'function') {
+                ruiyiForceClearCartState(reason);
+            } else {
+                cart = [];
+                window.cart = [];
+                if (typeof renderCart === 'function') {
+                    renderCart();
+                }
+            }
+
+            if (typeof clearPosCartStorage === 'function') {
+                clearPosCartStorage();
+            }
+
+            [0, 250, 1000].forEach(delay => {
+                setTimeout(() => {
+                    if (typeof clearPosCartStorage === 'function') {
+                        clearPosCartStorage();
+                    }
+                    if ((Array.isArray(window.cart) && window.cart.length > 0) ||
+                        (window.CartManager && Array.isArray(window.CartManager.cart) && window.CartManager.cart.length > 0)) {
+                        ruiyiForceClearCartState(reason + ':verify');
+                    }
+                }, delay);
+            });
+
+            console.log('[快速结账清理购物车] 已清空:', reason);
+        } catch (error) {
+            console.warn('[快速结账清理购物车] 失败:', reason, error);
+        }
+    }
+    window.ruiyiClearQuickCheckoutCart = ruiyiClearQuickCheckoutCart;
+
     function ruiyiClearCashierCartAfterTableCheckout(tableNumber = '', reason = 'table_checkout') {
         try {
             if (typeof ruiyiSuppressPosCartStorage === 'function') {
@@ -5335,10 +5421,14 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
             window.cartModified = false;
             window._forceEmptyCashierOnNextCajero = true;
 
-            if (typeof cart !== 'undefined') {
-                cart = [];
+            if (typeof ruiyiForceClearCartState === 'function') {
+                ruiyiForceClearCartState(reason);
+            } else {
+                if (typeof cart !== 'undefined') {
+                    cart = [];
+                }
+                window.cart = [];
             }
-            window.cart = [];
 
             if (typeof ruiyiSetCartTableIdentity === 'function') {
                 ruiyiSetCartTableIdentity('', reason);
@@ -20820,14 +20910,16 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
                   orderType: 'takeaway'
               }, 'takeaway');
 
-              // 3. 立即清空购物车
-              cart = [];
-              renderCart();
-
-              // 🔥🔥🔥 关键修复：显式清除收银购物车持久化存储
-              // 必须显式调用，因为 savePosCartToStorage 可能因 _posCartRestoreComplete=false 而跳过
-              if (typeof clearPosCartStorage === 'function') {
-                  clearPosCartStorage();
+              // 3. 立即清空购物车，并同步清理 CartManager/window.cart/本地缓存
+              if (typeof ruiyiClearQuickCheckoutCart === 'function') {
+                  ruiyiClearQuickCheckoutCart('instant_takeaway_checkout');
+              } else {
+                  cart = [];
+                  window.cart = [];
+                  renderCart();
+                  if (typeof clearPosCartStorage === 'function') {
+                      clearPosCartStorage();
+                  }
               }
 
               // 隐藏查看模式按钮和工具箱
@@ -20993,13 +21085,16 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
                       orderType: 'takeaway'
                   });
 
-                  // 🔥 立即清空购物车（与在线模式一致）
-                  cart = [];
-                  renderCart();
-
-                  // 🔥🔥🔥 关键修复：清除收银购物车持久化存储，防止刷新后恢复
-                  if (typeof clearPosCartStorage === 'function') {
-                      clearPosCartStorage();
+                  // 🔥 立即清空购物车（与在线模式一致），并同步清理 CartManager/window.cart/本地缓存
+                  if (typeof ruiyiClearQuickCheckoutCart === 'function') {
+                      ruiyiClearQuickCheckoutCart('takeaway_order_complete_offline');
+                  } else {
+                      cart = [];
+                      window.cart = [];
+                      renderCart();
+                      if (typeof clearPosCartStorage === 'function') {
+                          clearPosCartStorage();
+                      }
                   }
 
                   // 🔥 立即打开钱箱（现金/混合支付时，与在线模式一致）
@@ -21090,13 +21185,16 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
                       orderType: 'takeaway'
                   });
 
-                  // 清空购物车
-                  cart = [];
-                  renderCart();
-
-                  // 🔥🔥🔥 关键修复：清除收银购物车持久化存储，防止刷新后恢复
-                  if (typeof clearPosCartStorage === 'function') {
-                      clearPosCartStorage();
+                  // 清空购物车，并同步清理 CartManager/window.cart/本地缓存
+                  if (typeof ruiyiClearQuickCheckoutCart === 'function') {
+                      ruiyiClearQuickCheckoutCart('takeaway_order_complete_online');
+                  } else {
+                      cart = [];
+                      window.cart = [];
+                      renderCart();
+                      if (typeof clearPosCartStorage === 'function') {
+                          clearPosCartStorage();
+                      }
                   }
 
                   // 🔥 隐藏查看模式相关按钮和工具箱
@@ -22477,8 +22575,14 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
 
       // 输入框事件：格式化输入
       variosInput.addEventListener('input', function(e) {
-        // 🔥 允许字母、数字和小数点（支持字母+数字组合，如A123, BC45）
-        let value = this.value.replace(/[^0-9A-Za-z.]/g, '');
+        const rawValue = String(this.value || '');
+        const shouldApplyDiscount = rawValue.includes('/');
+        // 🔥 允许字母、数字、小数点和折扣快捷符 /（支持粘贴/触屏输入 10/）
+        let value = rawValue.replace(/[^0-9A-Za-z./]/g, '');
+        const discountCandidate = shouldApplyDiscount ? value.split('/')[0] : '';
+        if (shouldApplyDiscount) {
+          value = discountCandidate;
+        }
 
         // 确保只有一个小数点
         const parts = value.split('.');
@@ -22492,6 +22596,14 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
         }
 
         this.value = value;
+
+        if (shouldApplyDiscount && /^\d+(?:\.\d+)?$/.test(discountCandidate)) {
+          setTimeout(() => {
+            if (document.activeElement === variosInput || variosInput.value.trim()) {
+              applyDiscountFromVarios();
+            }
+          }, 0);
+        }
       });
 
       // 输入框按键事件：[+] 添加 Varios，[-] 搜索产品编号

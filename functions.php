@@ -1170,10 +1170,71 @@ function ruiyi_clear_table_status_all_formats($table_number_numeric) {
     });
 }
 
+if (!function_exists('ruiyi_pos_is_customer_source_request')) {
+    function ruiyi_pos_is_customer_source_request() {
+        $is_guest = isset($_POST['is_guest']) && $_POST['is_guest'] === 'yes';
+        if ($is_guest) {
+            return true;
+        }
+
+        $source_fields = array('source', 'order_source', 'request_source', 'ruiyi_order_source');
+        $customer_sources = array(
+            'carrito-cliente',
+            'cliente-carrito',
+            'customer',
+            'cliente',
+            'customer-qr',
+            'qr-customer',
+            'qr',
+            'scan',
+            'menu-cliente',
+        );
+
+        foreach ($source_fields as $field) {
+            if (!isset($_POST[$field])) {
+                continue;
+            }
+
+            $source = sanitize_text_field(wp_unslash($_POST[$field]));
+            $normalized = strtolower(str_replace(array('_', ' '), '-', $source));
+            if (in_array($normalized, $customer_sources, true)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
+if (!function_exists('ruiyi_pos_reject_customer_mutation_when_menu_only')) {
+    function ruiyi_pos_reject_customer_mutation_when_menu_only($context = '') {
+        if (!ruiyi_pos_is_customer_source_request()) {
+            return false;
+        }
+
+        if (get_option('pos_customer_menu_only_mode', '0') !== '1') {
+            return false;
+        }
+
+        ruiyi_debug_log('[customer-menu-only] 阻止客户来源写入请求: ' . $context);
+        status_header(403);
+        wp_send_json_error(array(
+            'message' => __('El modo solo menú está activo. No se pueden enviar ni modificar pedidos desde el menú del cliente.', 'ruiyi-pos'),
+            'menu_only' => true,
+            'blocked_context' => $context,
+        ));
+        return true;
+    }
+}
+
 add_action('wp_ajax_ruiyi_pos_clear_table_status', 'ruiyi_pos_clear_table_status_handler');
 add_action('wp_ajax_nopriv_ruiyi_pos_clear_table_status', 'ruiyi_pos_clear_table_status_handler');
 function ruiyi_pos_clear_table_status_handler() {
     check_ajax_referer('ruiyi_pos_nonce', 'nonce');
+
+    if (ruiyi_pos_reject_customer_mutation_when_menu_only('clear_table_status')) {
+        return;
+    }
 
     $is_guest = isset($_POST['is_guest']) && $_POST['is_guest'] === 'yes';
     $is_pos = isset($_POST['is_pos']) && $_POST['is_pos'] === 'yes';
@@ -2296,15 +2357,8 @@ function ruiyi_pos_create_order() {
 
     // Verificar si es pedido de invitado
     $is_guest = isset($_POST['is_guest']) && $_POST['is_guest'] === 'yes';
-    $order_request_source = isset($_POST['source']) ? sanitize_text_field(wp_unslash($_POST['source'])) : '';
-    $is_customer_menu_request = $order_request_source === 'carrito-cliente' || ($is_guest && !is_user_logged_in());
 
-    if ($is_customer_menu_request && get_option('pos_customer_menu_only_mode', '0') === '1') {
-        status_header(403);
-        wp_send_json_error(array(
-            'message' => __('El modo solo menú está activo. No se pueden enviar pedidos desde el menú del cliente.', 'ruiyi-pos'),
-            'menu_only' => true,
-        ));
+    if (ruiyi_pos_reject_customer_mutation_when_menu_only('create_order')) {
         return;
     }
     
@@ -17175,6 +17229,10 @@ add_action('wp_ajax_nopriv_ruiyi_debug_orders', 'ruiyi_debug_orders_table_number
 function ruiyi_pos_cancel_table_orders() {
     // Security check
     check_ajax_referer('ruiyi_pos_nonce', 'nonce');
+
+    if (ruiyi_pos_reject_customer_mutation_when_menu_only('cancel_table_orders')) {
+        return;
+    }
     
     // Check if guest request or authorized user
     $is_guest = isset($_POST['is_guest']) && $_POST['is_guest'] === 'yes';
@@ -26939,6 +26997,16 @@ function ruiyi_pos_get_order_receipt_with_qr_callback() {
                     </tr>
                     <?php
                 }
+                $receipt_actual_total_for_tax = max(0.0, floatval($order->get_total()));
+                $receipt_tax_divisor_for_history = 1 + ($receipt_tax_rate / 100);
+                $total_before_tax = $receipt_actual_total_for_tax / $receipt_tax_divisor_for_history;
+                $total_tax = $receipt_actual_total_for_tax - $total_before_tax;
+                $tax_groups = array();
+                $tax_groups[number_format($receipt_tax_rate, 0)] = array(
+                    'rate' => $receipt_tax_rate,
+                    'base' => $total_before_tax,
+                    'tax' => $total_tax,
+                );
                 ?>
                 </tbody>
             </table>
@@ -33256,6 +33324,16 @@ function ruiyi_generate_invoice_html($order, $customer_info) {
                     </tr>
                     <?php
                 }
+                $invoice_actual_total_for_tax = max(0.0, floatval($order_total));
+                $invoice_tax_divisor = 1 + ($receipt_tax_rate / 100);
+                $total_before_tax = $invoice_actual_total_for_tax / $invoice_tax_divisor;
+                $total_tax = $invoice_actual_total_for_tax - $total_before_tax;
+                $tax_groups = array();
+                $tax_groups[number_format($receipt_tax_rate, 0)] = array(
+                    'rate' => $receipt_tax_rate,
+                    'base' => $total_before_tax,
+                    'tax' => $total_tax,
+                );
                 ?>
                 </tbody>
             </table>
