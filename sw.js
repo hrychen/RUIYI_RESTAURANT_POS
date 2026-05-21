@@ -6,7 +6,7 @@
 
 // ==================== 缓存配置 ====================
 // 🔥 v72: 轻量 CDN 缓存（仅 CORS 资源，跳过 Tailwind 避免 opaque 7MB 惩罚）
-const CACHE_VERSION = 'v121';
+const CACHE_VERSION = 'v122';
 const STATIC_CACHE = `ruiyi-pos-static-${CACHE_VERSION}`;
 const RUNTIME_CACHE = `ruiyi-pos-runtime-${CACHE_VERSION}`;
 const IMAGE_CACHE = `ruiyi-pos-images-${CACHE_VERSION}`;

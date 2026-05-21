@@ -26461,6 +26461,10 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
           .swal2-popup.delivery-customer-modal { overflow: visible !important; max-width: 95vw !important; }
           .swal2-popup.delivery-customer-modal .swal2-html-container { overflow: visible !important; }
           .swal2-popup.delivery-customer-modal .text-left { overflow: visible; }
+          .swal2-popup.delivery-customer-modal .swal2-actions {
+            margin-top: 28px !important;
+            padding-top: 8px !important;
+          }
           .delivery-reorder-panel {
             border: 1px solid #fde68a;
             background: #fffbeb;
@@ -26800,7 +26804,7 @@ $current_language = defined('RUIYI_CURRENT_LANG') ? RUIYI_CURRENT_LANG : 'zh';
               return;
             }
 
-            reorderStatus.textContent = `<?php echo ruiyi_translate('Último', 'Latest', '最近一单'); ?>`;
+            reorderStatus.textContent = `<?php echo ruiyi_translate('Último pedido del cliente', 'Customer last order', '客户最后一单'); ?>`;
             reorderList.innerHTML = reorderOrders.map((order, index) => {
               const items = Array.isArray(order.items) ? order.items : [];
               const previewItems = items.slice(0, 3).map(item => `${escapeHtml(item.name || '')} x${parseFloat(item.quantity || 1)}`).join(', ');
